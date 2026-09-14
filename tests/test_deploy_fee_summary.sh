@@ -35,6 +35,11 @@ fi
 STELLAR
 chmod +x "$WORKDIR/bin/stellar"
 
+if grep -q 'mapfile' "$REPO_ROOT/scripts/deploy-testnet.sh" "$REPO_ROOT/scripts/deploy-mainnet.sh"; then
+  echo 'deployment scripts must remain compatible with Bash 3.2 (no mapfile)' >&2
+  exit 1
+fi
+
 for script in deploy-testnet.sh deploy-mainnet.sh; do
   output=$(cd "$WORKDIR" && \
     PATH="$WORKDIR/bin:$PATH" STELLAR_ACCOUNT=source ADMIN_ADDRESS=GADMIN \

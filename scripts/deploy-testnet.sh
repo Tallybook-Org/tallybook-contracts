@@ -58,7 +58,10 @@ run_stellar_with_fee() {
   fi
   cat "$cost_output" >&2
 
-  mapfile -t fee_lines < <(grep -Eo 'Fee Charged: *[0-9]+' "$cost_output" | sed -E 's/.*: *//')
+  fee_lines=()
+  while IFS= read -r line; do
+    fee_lines+=("$line")
+  done < <(grep -Eo 'Fee Charged: *[0-9]+' "$cost_output" | sed -E 's/.*: *//')
   if [ "${#fee_lines[@]}" -ne 1 ]; then
     echo "Could not determine one final fee charged for $label." >&2
     return 1
