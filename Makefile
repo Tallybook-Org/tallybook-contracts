@@ -13,7 +13,7 @@ build-statement-registry: build-price-book
 	stellar contract build --package statement-registry
 
 test:
-	cargo test --workspace
+	cargo test --locked --workspace
 
 fmt:
 	cargo fmt --all
@@ -22,7 +22,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 clippy:
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 
 clean:
 	cargo clean
