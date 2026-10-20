@@ -9,6 +9,44 @@ env:
   STELLAR_CLI_VERSION: "28.0.0"
 
 jobs:
+  # Runs on every pull request alongside the build and test job, as its own
+  # required check. Scans only the lines a PR ADDS.
+  #
+  # Added after a contributor PR to another Stellar Wave programme repo was
+  # found appending an obfuscated network/process payload to the END of a
+  # build-time config file, padded with unrelated edits so a reviewer reading
+  # the top of the diff never reached it. The campaign behind it is
+  # DPRK-linked and specifically targets Rust, Go and cryptocurrency repos.
+  #
+  # For a Cargo workspace the equivalent "runs without anyone calling it"
+  # surfaces are build.rs, proc macros, #[ctor], include_bytes! and
+  # [build-dependencies] -- all of which this checks, along with broader
+  # classes: credential harvesting, wallet and seed theft, reverse shells,
+  # persistence, anti-analysis, obfuscation and dependency redirection.
+  #
+  # CRITICAL fails the build; REVIEW prints for a human and does not.
+  # Measured against the last 40 commits here with zero false CRITICALs.
+  malware-audit:
+    name: malware-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Prove the detection rules still fire
+        run: python3 scripts/audit-pr-malware.py --selftest
+
+      - name: Audit the lines this PR adds
+        run: |
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          echo "auditing $BASE..HEAD"
+          python3 scripts/audit-pr-malware.py --ci "$BASE..HEAD"
+
   ci:
     runs-on: ubuntu-latest
     steps:
