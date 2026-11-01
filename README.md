@@ -22,6 +22,12 @@ essentials; the docs site covers everything.
 **Neither contract has been audited, and both are deployed to testnet only. Do not use
 them with real funds — see [SECURITY.md](SECURITY.md).**
 
+The addresses above are the `v0.1.0` build. `price_book::extend_version_ttl` and
+`statement_registry::verify_charge` were added after it and are not live at those
+addresses yet; `make build` reports the current wasm hashes, and the next testnet deploy
+will update this table. Everything else in this README describes the code in this
+repository, which is what `make test` runs against.
+
 ## The problem
 
 Machine-paid APIs settle three different ways today, and none of the three leaves the
@@ -108,6 +114,20 @@ on-chain.
   version number `operator` has published. Errors: `NotFound` if `operator` has never
   published.
 
+- **`extend_version_ttl(operator: Address, version: u32, ledgers: u32) -> Result<(), Error>`**
+  — **no auth, intentionally**, and for the same reason
+  `statement_registry`'s `extend_statement_ttl` has none: anyone may pay rent to keep an
+  audit record alive. Here that reason is load bearing rather than merely convenient. A
+  statement is only falsifiable while the price evidence it names is still readable —
+  `Version` holds the schedule hash and URI the amounts were priced against, and
+  `Timeline` is what `version_at()` searches to confirm which version was in force. The
+  only other writer touching either key is `publish()`, which requires the operator's
+  auth, and an operator who has stopped publishing never calls it again; without this
+  function a stranger could keep a statement alive indefinitely while the prices it
+  depends on archived out from under it. Extends the version and the timeline together —
+  extending one without the other leaves an audit record half readable. `ledgers` is
+  clamped to a sane maximum. Errors: `NotFound`.
+
 - **`version_at(operator: Address, ledger: u32) -> Result<u32, Error>`** — no auth,
   read-only. Returns which version of `operator`'s schedule was in force at `ledger`: the
   version with the highest `effective_ledger` not exceeding `ledger`. This is the
@@ -173,6 +193,24 @@ and is immutable.
   Errors: `ProofTooLong` if `proof` has more than `MAX_PROOF_NODES` (32) entries,
   `NotFound` if no such statement exists.
 
+- **`verify_charge(operator, seq: u64, record: UsageRecord, proof: Vec<BytesN<32>>) -> Result<bool, Error>`**
+  — no auth. **This is the function an invoice line is checked with.** Where
+  `verify_usage` takes an opaque 32-byte leaf and answers only "is this hash in the
+  tree" — leaving the caller trusting whoever computed the leaf, including on how the
+  amount and price version were encoded into it — `verify_charge` takes the record's own
+  fields, derives the leaf itself, and binds the record to the statement before folding:
+  `record.consumer` must be the statement's `consumer`, `record.price_v` must be the
+  statement's `price_book_version` (the version `anchor()` already proved was in force
+  across the whole period), and `record.ledger` must fall inside
+  `[period_start, period_end]`, both inclusive. Together with `anchor()`'s price check
+  that is the full chain a buyer needs: this request, at this price version, inside this
+  period, under a schedule the price book agrees was in force then. Returns `Ok(false)`
+  for a record that is consistent with the statement but whose proof does not reach
+  `usage_root`; the record errors are for input that contradicts the statement outright,
+  where `false` would under-report what is wrong.
+  Errors: `ProofTooLong`, `NotFound`, `RecordConsumerMismatch`, `RecordPriceMismatch`,
+  `RecordOutsidePeriod`.
+
 - **`open_dispute(operator, seq: u64, consumer: Address, reason_hash: BytesN<32>) -> Result<(), Error>`**
   — callable only by the statement's `consumer`. `consumer` must match the statement's
   own `consumer` field — a mismatch returns `NotFound`, the same error as a missing
@@ -226,12 +264,71 @@ and is immutable.
 | 12 | `CreditTooLarge` | `amount_credited` is negative or exceeds `amount_billed`. |
 | 13 | `ProofTooLong` | A merkle proof longer than `MAX_PROOF_NODES` (32). |
 | 14 | `PeriodSpansPriceChange` | `version_at(period_start) != version_at(period_end)`: the schedule changed partway through the period, so no single `price_book_version` honestly covers the whole thing. Distinct from `PriceVersionStale`, which is about the claimed version not matching what's in force — this is about the period itself straddling a change, independent of what was claimed. |
+| 15 | `RecordConsumerMismatch` | `verify_charge`: the record's `consumer` is not the statement's, so it was never part of this bill whatever the proof shows. |
+| 16 | `RecordPriceMismatch` | `verify_charge`: the record's `price_v` is not the statement's `price_book_version`. |
+| 17 | `RecordOutsidePeriod` | `verify_charge`: the record's `ledger` falls outside `[period_start, period_end]`. |
 
 #### Events
 
 - `anchor` — topics `("statement", "anchor")`, data `(operator: Address, consumer: Address, seq: u64, usage_root: BytesN<32>, amount_billed: i128, amount_settled: i128, protocol: Protocol)`.
 - `dispute` — topics `("statement", "dispute")`, data `(operator: Address, consumer: Address, seq: u64, reason_hash: BytesN<32>)`.
 - `resolve` — topics `("statement", "resolve")`, data `(operator: Address, consumer: Address, seq: u64, resolution_hash: BytesN<32>, amount_credited: i128)`.
+
+## The usage record leaf format
+
+A usage tree leaf is derived from one billed request. The derivation is fixed and is
+implemented twice — here, in `contracts/statement-registry/src/leaf.rs`, and in the
+off-chain collector's `internal/merkle/leaf.go` in the
+[`tallybook`](https://github.com/Tallybook-Org/tallybook) repo. The two must agree byte
+for byte or every proof the collector produces is invalid on chain.
+
+```
+record_bytes = XDR(ScVal::Map{           // symbol keys, sorted alphabetically
+    "amount":   I128(charged_amount),
+    "consumer": Address(consumer),       // G… account, or C… channel contract
+    "endpoint": Bytes(sha256(method || " " || path_template)),
+    "ledger":   U32(settlement_or_observation_ledger),
+    "price_v":  U32(price_book_version),
+    "reqid":    Bytes(request_id),
+    "units":    U64(unit_count),
+})
+leaf = sha256(sha256(record_bytes))
+```
+
+On this side that is not a hand-rolled encoder: `UsageRecord` is a `#[contracttype]`
+struct, and the macro encodes a named-field struct as exactly that `ScVal::Map`, keyed by
+field names as symbols, sorted alphabetically. The type *is* the format.
+
+The hash is applied twice on purpose. Sorted-pair folding gives internal nodes no domain
+tag of their own, so a single hash would leave a leaf and an internal node
+indistinguishable and an internal node could be presented as a leaf. Hashing the record
+twice puts every leaf one hash further from the folding domain.
+
+### Cross-repo fixtures
+
+`fixtures/merkle/` is the contract test between the two implementations. Both repos
+commit the same files and test against them.
+
+- `single-leaf.json`, `four-leaves.json`, `seven-leaves.json` (unbalanced) pin how
+  `fold` combines nodes. They start from leaves that are already hashes, so they say
+  nothing about how a request becomes a leaf.
+- `records.json` pins that other half: six records with their `record_bytes` and leaf.
+  Each vector carries `record_bytes` as well as the leaf so a mismatch localises itself —
+  `record_bytes` differing means the encoding drifted, only the leaf differing means the
+  hashing did. The vectors are chosen for where two implementations actually diverge: a
+  negative amount (the two's-complement path), both ends of the `i128` range with the
+  `u32` and `u64` ceilings, and an MPP session record whose `consumer` is the channel
+  contract (`C…`) rather than an account (`G…`).
+
+`records.json` is generated from this repo's own implementation, not written by hand.
+Regenerate it with:
+
+```sh
+TALLYBOOK_WRITE_FIXTURES=1 cargo test -p statement-registry record_vectors
+```
+
+Without that variable the same test only compares, so the committed file cannot drift
+from the code that produced it without CI failing.
 
 ## Known limitations
 
