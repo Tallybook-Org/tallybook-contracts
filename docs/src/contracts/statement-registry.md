@@ -70,6 +70,36 @@ doesn't exist), folds `leaf` up through `proof` (see [Merkle verification](merkl
 and returns whether the result equals `usage_root` — `Ok(false)`, not an error, for a
 well-formed proof that doesn't match.
 
+### `verify_charge(env, operator: Address, seq: u64, record: UsageRecord, proof: Vec<BytesN<32>>) -> Result<bool, Error>`
+
+No auth. **This is the call an invoice line is checked with**, and the one a buyer
+should reach for; `verify_usage` above answers a narrower question.
+
+`verify_usage` takes an opaque 32-byte leaf, so it can only say whether that hash is
+in the tree. It cannot say what the hash means, which leaves the caller trusting
+whoever computed it — including on how the amount and the price version were encoded.
+`verify_charge` instead takes the record's own fields, derives the leaf itself (see
+[Merkle verification](merkle.md)), and binds the record to the statement before
+folding:
+
+| Check | Failure |
+|---|---|
+| `record.consumer == statement.consumer` | `RecordConsumerMismatch` |
+| `record.price_v == statement.price_book_version` | `RecordPriceMismatch` |
+| `period_start <= record.ledger <= period_end`, both inclusive | `RecordOutsidePeriod` |
+
+`price_book_version` is the version `anchor()` already proved was in force across the
+whole period, so pinning a line to it is what ties an individual charge to the
+schedule the statement claims to have been billed under. Together with `anchor()`'s
+own price check that is the full chain: this request, at this price version, inside
+this period, under a schedule the price book agrees was in force then.
+
+Returns `Ok(false)` — not an error — for a record that is consistent with the
+statement but whose proof doesn't reach `usage_root`: a well-formed claim that simply
+isn't in the tree. The three record errors are for input that contradicts the
+statement outright, where `false` would under-report what is wrong. `ProofTooLong`
+and `NotFound` behave exactly as in `verify_usage`.
+
 ### `open_dispute(env, operator: Address, seq: u64, consumer: Address, reason_hash: BytesN<32>) -> Result<(), Error>`
 
 Callable only by the statement's own `consumer` (`consumer.require_auth()`). If the
