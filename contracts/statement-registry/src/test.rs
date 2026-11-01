@@ -4,7 +4,7 @@
 // for building throwaway data like the leaf array below.
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, String};
+use soroban_sdk::{testutils::Address as _, xdr::ToXdr as _, Address, Bytes, BytesN, Env, String};
 
 use crate::{Error, StatementRegistry};
 
@@ -1592,5 +1592,239 @@ mod integration {
         assert_eq!(dispute.resolution_hash, Some(resolution_hash));
         assert_eq!(dispute.amount_credited, 400);
         assert!(dispute.resolved_ledger.is_some());
+    }
+}
+
+/// The record -> leaf derivation, which is the half of the merkle format
+/// the `fixtures/merkle/*-leaves.json` trees never touch: those fixtures
+/// start from leaves that are already hashes, so they prove `fold` agrees
+/// across repos while saying nothing about how a billed request becomes a
+/// leaf in the first place. `fixtures/merkle/records.json` covers that
+/// half, and the collector in the `tallybook` repo tests its own encoder
+/// (`internal/merkle/leaf.go`) against the same file.
+mod leaf {
+    use super::*;
+    use crate::leaf::{leaf_hash, UsageRecord};
+    use std::{format, fs, string::String as StdString, vec, vec::Vec as StdVec};
+
+    /// Where the fixture lives, relative to this crate rather than to the
+    /// working directory a test happens to be run from.
+    const FIXTURE_PATH: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/merkle/records.json");
+
+    fn hex(bytes: &[u8]) -> StdString {
+        let mut out = StdString::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+
+    /// One vector's inputs, in the form a collector would have them before
+    /// encoding: a method and path template rather than an endpoint hash.
+    struct Vector {
+        label: &'static str,
+        method: &'static str,
+        path: &'static str,
+        amount: i128,
+        consumer: &'static str,
+        ledger: u32,
+        price_v: u32,
+        reqid: [u8; 32],
+        units: u64,
+    }
+
+    /// Fixed addresses, derived from fixed 32-byte payloads (0x11.., 0x22..,
+    /// 0x33..) so the strkeys are reproducible from the raw bytes on either
+    /// side of the repo boundary rather than copied on trust.
+    const ACCOUNT_A: &str = "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M";
+    const ACCOUNT_B: &str = "GARCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCFRVX";
+    const CHANNEL_CONTRACT: &str = "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH";
+
+    fn vectors() -> StdVec<Vector> {
+        vec![
+            // The floor case: one unit, one stroop, lowest sensible ledger.
+            Vector {
+                label: "minimal",
+                method: "GET",
+                path: "/v1/search",
+                amount: 1,
+                consumer: ACCOUNT_A,
+                ledger: 1,
+                price_v: 1,
+                reqid: [0u8; 32],
+                units: 1,
+            },
+            // What the overwhelming majority of real records look like:
+            // a single request at 0.01 USDC, which is 100_000 in USDC's
+            // seven-decimal smallest unit.
+            Vector {
+                label: "typical x402 request at 0.01 usdc",
+                method: "GET",
+                path: "/v1/search",
+                amount: 100_000,
+                consumer: ACCOUNT_A,
+                ledger: 58_123_456,
+                price_v: 3,
+                reqid: [0xab; 32],
+                units: 1,
+            },
+            // A negative amount: a credit line on a resolved dispute. This
+            // is the vector that catches a two's-complement bug in an
+            // i128 encoder, which is the most likely place for the two
+            // implementations to diverge without anyone noticing.
+            Vector {
+                label: "credit line, negative amount",
+                method: "POST",
+                path: "/v1/embed",
+                amount: -100_000,
+                consumer: ACCOUNT_B,
+                ledger: 58_123_457,
+                price_v: 3,
+                reqid: [0x01; 32],
+                units: 1,
+            },
+            // MPP session mode, where `consumer` is the channel contract
+            // (`C…`) and not an account (`G…`). An encoder that only
+            // handles account strkeys fails outright on this one.
+            Vector {
+                label: "mpp session, channel contract consumer",
+                method: "GET",
+                path: "/v1/stream",
+                amount: 250,
+                consumer: CHANNEL_CONTRACT,
+                ledger: 58_200_000,
+                price_v: 4,
+                reqid: [0x7f; 32],
+                units: 5,
+            },
+            // Both ends of the i128 range, plus the u32 and u64 ceilings,
+            // so the Hi/Lo split of an i128 and the full width of every
+            // other field are pinned rather than assumed.
+            Vector {
+                label: "i128 max and field ceilings",
+                method: "GET",
+                path: "/v1/search",
+                amount: i128::MAX,
+                consumer: ACCOUNT_A,
+                ledger: u32::MAX,
+                price_v: u32::MAX,
+                reqid: [0xff; 32],
+                units: u64::MAX,
+            },
+            Vector {
+                label: "i128 min and field floors",
+                method: "GET",
+                path: "/v1/search",
+                amount: i128::MIN,
+                consumer: ACCOUNT_B,
+                ledger: 0,
+                price_v: 0,
+                reqid: [0x00; 32],
+                units: 0,
+            },
+        ]
+    }
+
+    /// `sha256(method || " " || path_template)`, the record's `endpoint`
+    /// field. The collector derives the same value for its pricing lookup,
+    /// so it is pinned here too rather than left to the caller.
+    fn endpoint_hash(env: &Env, method: &str, path: &str) -> BytesN<32> {
+        let mut bytes = Bytes::new(env);
+        bytes.extend_from_slice(method.as_bytes());
+        bytes.extend_from_slice(b" ");
+        bytes.extend_from_slice(path.as_bytes());
+        env.crypto().sha256(&bytes).to_bytes()
+    }
+
+    fn rendered_fixture(env: &Env) -> StdString {
+        let mut records = StdVec::new();
+        for v in vectors() {
+            let endpoint = endpoint_hash(env, v.method, v.path);
+            let record = UsageRecord {
+                amount: v.amount,
+                consumer: Address::from_str(env, v.consumer),
+                endpoint: endpoint.clone(),
+                ledger: v.ledger,
+                price_v: v.price_v,
+                reqid: BytesN::from_array(env, &v.reqid),
+                units: v.units,
+            };
+            // `record_bytes` is carried alongside the leaf so a mismatch
+            // on the other side of the repo boundary localises itself: if
+            // record_bytes differs the encoding drifted, if only the leaf
+            // differs the hashing did.
+            let record_bytes = record.clone().to_xdr(env);
+            let mut raw = std::vec![0u8; record_bytes.len() as usize];
+            record_bytes.copy_into_slice(&mut raw);
+
+            records.push(serde_json::json!({
+                "label": v.label,
+                "endpoint_method": v.method,
+                "endpoint_path": v.path,
+                "amount": format!("{}", v.amount),
+                "consumer": v.consumer,
+                "endpoint": hex(&endpoint.to_array()),
+                "ledger": v.ledger,
+                "price_v": v.price_v,
+                "reqid": hex(&v.reqid),
+                "units": v.units,
+                "record_bytes": hex(&raw),
+                "leaf": hex(&leaf_hash(env, &record).to_array()),
+            }));
+        }
+
+        let doc = serde_json::json!({
+            "format": "XDR(ScVal::Map) over symbol keys sorted alphabetically, then leaf = sha256(sha256(record_bytes))",
+            "records": records,
+        });
+        serde_json::to_string_pretty(&doc).expect("serialize fixture")
+    }
+
+    /// Regenerate with `TALLYBOOK_WRITE_FIXTURES=1 cargo test -p
+    /// statement-registry record_vectors`. Without that variable the test
+    /// only compares, so the committed file cannot drift from the code
+    /// that produced it without CI failing.
+    #[test]
+    fn record_vectors_match_the_committed_fixture() {
+        let env = Env::default();
+        let rendered = rendered_fixture(&env);
+
+        if std::env::var("TALLYBOOK_WRITE_FIXTURES").is_ok() {
+            fs::write(FIXTURE_PATH, format!("{rendered}\n")).expect("write fixture");
+            return;
+        }
+
+        let committed = fs::read_to_string(FIXTURE_PATH).expect("read fixture");
+        assert_eq!(
+            committed.trim_end(),
+            rendered.trim_end(),
+            "fixtures/merkle/records.json is out of sync with the leaf derivation that produced it"
+        );
+    }
+
+    /// The leaf format's double hash is what keeps a leaf out of the
+    /// folding domain, so it is asserted directly rather than inferred
+    /// from the fixture: a leaf must be sha256 of the sha256 of the
+    /// record, never the single hash.
+    #[test]
+    fn leaf_is_the_double_hash_of_the_record_bytes() {
+        let env = Env::default();
+        let record = UsageRecord {
+            amount: 100_000,
+            consumer: Address::from_str(&env, ACCOUNT_A),
+            endpoint: endpoint_hash(&env, "GET", "/v1/search"),
+            ledger: 58_123_456,
+            price_v: 3,
+            reqid: BytesN::from_array(&env, &[0xab; 32]),
+            units: 1,
+        };
+
+        let record_bytes = record.clone().to_xdr(&env);
+        let single = env.crypto().sha256(&record_bytes).to_bytes();
+        let double = env.crypto().sha256(&Bytes::from(single.clone())).to_bytes();
+
+        assert_eq!(leaf_hash(&env, &record), double);
+        assert_ne!(leaf_hash(&env, &record), single);
     }
 }
