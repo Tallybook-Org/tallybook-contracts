@@ -40,10 +40,21 @@ if grep -q 'mapfile' "$REPO_ROOT/scripts/deploy-testnet.sh" "$REPO_ROOT/scripts/
   exit 1
 fi
 
+# Run copies of the scripts from inside the sandbox rather than the originals.
+# Both scripts resolve their own REPO_ROOT from $BASH_SOURCE and cd to it,
+# which undoes any `cd "$WORKDIR"` the caller does -- so invoking the
+# originals pointed the stub `stellar contract build` at the real
+# target/wasm32v1-none/release/ and overwrote both compiled contracts with a
+# four-byte stub. That broke `cargo test` afterwards, because
+# statement-registry contractimports price_book.wasm at compile time. Copied
+# verbatim, so what runs is still exactly the committed script; only the
+# directory it resolves as its repo root changes.
+mkdir -p "$WORKDIR/scripts"
+cp "$REPO_ROOT/scripts/deploy-testnet.sh" "$REPO_ROOT/scripts/deploy-mainnet.sh" "$WORKDIR/scripts/"
+
 for script in deploy-testnet.sh deploy-mainnet.sh; do
-  output=$(cd "$WORKDIR" && \
-    PATH="$WORKDIR/bin:$PATH" STELLAR_ACCOUNT=source ADMIN_ADDRESS=GADMIN \
-    STELLAR_RPC_URL=https://rpc.example CONFIRM=yes "$REPO_ROOT/scripts/$script")
+  output=$(PATH="$WORKDIR/bin:$PATH" STELLAR_ACCOUNT=source ADMIN_ADDRESS=GADMIN \
+    STELLAR_RPC_URL=https://rpc.example CONFIRM=yes "$WORKDIR/scripts/$script")
   grep -F 'price_book WASM upload fee (stroops): 11' <<<"$output"
   grep -F 'price_book deploy fee (stroops):      13' <<<"$output"
   grep -F 'statement_registry WASM upload fee (stroops): 17' <<<"$output"
@@ -52,9 +63,8 @@ for script in deploy-testnet.sh deploy-mainnet.sh; do
 done
 
 if (
-  cd "$WORKDIR"
   PATH="$WORKDIR/bin:$PATH" EXTRA_FEE=1 STELLAR_ACCOUNT=source ADMIN_ADDRESS=GADMIN \
-    "$REPO_ROOT/scripts/deploy-testnet.sh"
+    "$WORKDIR/scripts/deploy-testnet.sh"
 ); then
   echo 'expected duplicate fee lines to fail' >&2
   exit 1
