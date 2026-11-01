@@ -40,6 +40,7 @@ or prints one, per this repo's own security rule against that.
 Assumes two identities named `tb-deployer` (operator) and
 `tb-consumer-demo` (consumer) already exist in that store.
 """
+import os
 import re
 import subprocess
 import sys
@@ -49,9 +50,16 @@ from stellar_sdk.auth import authorize_entry
 from stellar_sdk.exceptions import PrepareTransactionException
 from stellar_sdk.soroban_rpc import GetTransactionStatus
 
-RPC = "https://soroban-testnet.stellar.org"
+RPC = os.environ.get("STELLAR_RPC_URL", "https://soroban-testnet.stellar.org")
 NETWORK = Network.TESTNET_NETWORK_PASSPHRASE
-CONTRACT = "CB75TTWGP3TLKEDGA2WOLEVCNKLUX6X5KS47GMWGBHUAVES7J55LY25M"
+# Overridable because a redeploy changes it: these contracts have no upgrade
+# path on purpose, so every rebuild of the wasm means a new address. The
+# variable name matches the one the off-chain collector in the tallybook repo
+# already reads, so a single exported value drives both.
+CONTRACT = os.environ.get(
+    "TB_STATEMENT_REGISTRY_ID",
+    "CCT5AAVONSVWQGMINQN7TOJGSUZE6KUIFSSMEN2USNNEZFWR5ZX6UKU3",
+)
 
 # statement_registry's Error enum (contracts/statement-registry/src/error.rs).
 # Discriminant 1 is deliberately unused there -- see errors.md -- so it's
