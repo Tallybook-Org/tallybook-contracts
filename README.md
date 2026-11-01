@@ -76,6 +76,24 @@ on-chain part — two contracts, nothing else.
    root with `verify_usage` — no need to trust the seller's off-chain books. If a charge
    looks wrong, `open_dispute` puts that in public view too.
 
+## The rest of Tallybook
+
+This repository is the on-chain half. The off-chain half — metering, custody,
+sweeping, indexing — is a separate repository,
+[`Tallybook-Org/tallybook`](https://github.com/Tallybook-Org/tallybook), which
+consumes these two contracts' deployed interfaces by contract ID and vendors or forks
+none of their code. Three services over one Postgres database: a **collector** that
+wraps a paid API and prices each request, a **settler** that sweeps channel revenue
+before a payer can reclaim it, and an **indexer** that reconciles anchored statements
+against what actually settled on chain.
+
+The two repositories share one hard constraint. The collector's merkle tree builder
+and this repository's `leaf.rs` must agree byte for byte, or every proof the collector
+produces is invalid on chain. Both commit the same `fixtures/merkle/` files and test
+against them — see [The usage record leaf format](#the-usage-record-leaf-format).
+
+Neither repository has been audited.
+
 ## Contracts
 
 The two crates in this repo are named `price-book` and `statement-registry`; the
