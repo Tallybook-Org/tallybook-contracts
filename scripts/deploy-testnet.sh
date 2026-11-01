@@ -51,22 +51,45 @@ run_stellar_with_fee() {
   cost_output="$(mktemp)"
   trap 'rm -f "$cost_output"' RETURN
 
-  if ! LAST_COMMAND_OUTPUT=$("$@" --cost 2> "$cost_output"); then
+  # --cost is passed by each caller rather than appended here. `contract
+  # deploy` takes constructor arguments after a `--` separator, and
+  # anything appended past that point is parsed as a constructor argument:
+  # appending it here made every deploy fail with "unexpected argument
+  # '--cost' found" against the contract's own __constructor usage.
+  if ! LAST_COMMAND_OUTPUT=$("$@" 2> "$cost_output"); then
     cat "$cost_output" >&2
     echo "Failed while submitting $label." >&2
     return 1
   fi
   cat "$cost_output" >&2
 
+  # stellar-cli 28's --cost table prints three different rows whose text ends
+  # in "Fee Charged" -- "Inclusion Fee Charged", "Resource Fee Charged", and
+  # the total "Fee Charged" -- and prints the inclusion row twice. Matching
+  # the bare substring found all four, and this function then rejected its
+  # own input as ambiguous, which made a real deployment impossible. Anchor
+  # to the start of the row instead: past the box border and whitespace, but
+  # before any word, so only the total matches.
   fee_lines=()
   while IFS= read -r line; do
     fee_lines+=("$line")
-  done < <(grep -Eo 'Fee Charged: *[0-9]+' "$cost_output" | sed -E 's/.*: *//')
-  if [ "${#fee_lines[@]}" -ne 1 ]; then
-    echo "Could not determine one final fee charged for $label." >&2
+  done < <(grep -E '^[^[:alnum:]]*Fee Charged:[[:space:]]*[0-9]+' "$cost_output" \
+    | grep -Eo 'Fee Charged:[[:space:]]*[0-9]+' | sed -E 's/.*:[[:space:]]*//')
+
+  if [ "${#fee_lines[@]}" -gt 1 ]; then
+    echo "Found ${#fee_lines[@]} final fees for $label; expected one." >&2
     return 1
   fi
-  LAST_FEE_CHARGED="${fee_lines[0]}"
+  if [ "${#fee_lines[@]}" -eq 0 ]; then
+    # No cost table at all means no transaction was submitted. `contract
+    # upload` skips the install when that wasm is already on the network,
+    # which is the normal case on every re-run -- treating it as a failure
+    # made the scripts single-use. Nothing was charged, so nothing to add.
+    echo "No transaction submitted for $label (nothing charged)." >&2
+    LAST_FEE_CHARGED=0
+  else
+    LAST_FEE_CHARGED="${fee_lines[0]}"
+  fi
   rm -f "$cost_output"
   trap - RETURN
 }
@@ -80,14 +103,14 @@ stellar contract build --package statement-registry
 echo "==> Uploading price_book WASM to $NETWORK" >&2
 run_stellar_with_fee "price_book WASM upload" \
   stellar contract upload --wasm "$PRICE_BOOK_WASM" \
-  --source-account "$STELLAR_ACCOUNT" --network "$NETWORK"
+  --source-account "$STELLAR_ACCOUNT" --network "$NETWORK" --cost
 PRICE_BOOK_WASM_ID="$LAST_COMMAND_OUTPUT"
 PRICE_BOOK_WASM_UPLOAD_FEE="$LAST_FEE_CHARGED"
 
 echo "==> Deploying price_book to $NETWORK" >&2
 run_stellar_with_fee "price_book deploy" \
   stellar contract deploy --wasm-hash "$PRICE_BOOK_WASM_ID" \
-  --source-account "$STELLAR_ACCOUNT" --network "$NETWORK" \
+  --source-account "$STELLAR_ACCOUNT" --network "$NETWORK" --cost \
   -- --admin "$ADMIN_ADDRESS"
 PRICE_BOOK_ID="$LAST_COMMAND_OUTPUT"
 PRICE_BOOK_DEPLOY_FEE="$LAST_FEE_CHARGED"
@@ -95,14 +118,14 @@ PRICE_BOOK_DEPLOY_FEE="$LAST_FEE_CHARGED"
 echo "==> Uploading statement_registry WASM to $NETWORK" >&2
 run_stellar_with_fee "statement_registry WASM upload" \
   stellar contract upload --wasm "$STATEMENT_REGISTRY_WASM" \
-  --source-account "$STELLAR_ACCOUNT" --network "$NETWORK"
+  --source-account "$STELLAR_ACCOUNT" --network "$NETWORK" --cost
 STATEMENT_REGISTRY_WASM_ID="$LAST_COMMAND_OUTPUT"
 STATEMENT_REGISTRY_WASM_UPLOAD_FEE="$LAST_FEE_CHARGED"
 
 echo "==> Deploying statement_registry to $NETWORK (price_book = $PRICE_BOOK_ID)" >&2
 run_stellar_with_fee "statement_registry deploy" \
   stellar contract deploy --wasm-hash "$STATEMENT_REGISTRY_WASM_ID" \
-  --source-account "$STELLAR_ACCOUNT" --network "$NETWORK" \
+  --source-account "$STELLAR_ACCOUNT" --network "$NETWORK" --cost \
   -- --admin "$ADMIN_ADDRESS" --price_book "$PRICE_BOOK_ID"
 STATEMENT_REGISTRY_ID="$LAST_COMMAND_OUTPUT"
 STATEMENT_REGISTRY_DEPLOY_FEE="$LAST_FEE_CHARGED"
