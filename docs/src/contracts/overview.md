@@ -40,15 +40,19 @@ against revenue. Writing it once per request would have cost about $3,616 to bil
 $1,000 of that same example month's usage — more than the revenue it would have
 recorded. Everything that would require a per-request on-chain write — metering
 itself, and the off-chain custody and sweeping of payment-channel commitments — stays
-off-chain by design; see [How it works](../how-it-works.md) for what's built versus
-planned.
+off-chain by design; see [How it works](../how-it-works.md) for which step runs
+where.
 
 ## Deployed contracts
 
 | Contract | Address | Wasm hash | Explorer |
 |---|---|---|---|
-| `price_book` | `CB2IEP4SQ2GC5747HFHNMXEYWEULC5Z5TTTLET2QA4CAA5SYCWAXFKAW` | `b5114557a95572057ad63e5131ea0e3618ad1f983caed42a1724da7c78eda94a` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CB2IEP4SQ2GC5747HFHNMXEYWEULC5Z5TTTLET2QA4CAA5SYCWAXFKAW) |
-| `statement_registry` | `CB75TTWGP3TLKEDGA2WOLEVCNKLUX6X5KS47GMWGBHUAVES7J55LY25M` | `cf10992a1eb272f9fb440ae74bce54b97136e0ae777afaaf82266dc37bed4d5a` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CB75TTWGP3TLKEDGA2WOLEVCNKLUX6X5KS47GMWGBHUAVES7J55LY25M) |
+| `price_book` | `CC6VXCEIXGGFIZXH2DGPVPUXYVVI3YVEQQ5M7XAWNEN7SADIYACTRFZ6` | `d03c8c9b193810b7bc0755d8dc8e517d4b1279cac29f4e1ce0e43d786ec08188` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CC6VXCEIXGGFIZXH2DGPVPUXYVVI3YVEQQ5M7XAWNEN7SADIYACTRFZ6) |
+| `statement_registry` | `CCT5AAVONSVWQGMINQN7TOJGSUZE6KUIFSSMEN2USNNEZFWR5ZX6UKU3` | `c309069607e59b48c7cf65ee4f353a8cefcfe361b73a6c3ae74eb984733defd9` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CCT5AAVONSVWQGMINQN7TOJGSUZE6KUIFSSMEN2USNNEZFWR5ZX6UKU3) |
+
+These contracts have no upgrade path by design, so a new build is a new deployment at
+a new address rather than an in-place upgrade. The `v0.1.0` addresses are still on
+chain and simply no longer current.
 
 Both are testnet only, and neither has been audited — see
 [SECURITY.md](https://github.com/Tallybook-Org/tallybook-contracts/blob/main/SECURITY.md).

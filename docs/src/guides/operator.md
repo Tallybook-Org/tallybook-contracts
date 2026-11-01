@@ -33,7 +33,7 @@ schedule file, then call `publish`:
 
 ```
 stellar contract invoke \
-  --id CB2IEP4SQ2GC5747HFHNMXEYWEULC5Z5TTTLET2QA4CAA5SYCWAXFKAW \
+  --id CC6VXCEIXGGFIZXH2DGPVPUXYVVI3YVEQQ5M7XAWNEN7SADIYACTRFZ6 \
   --network testnet \
   --source my-operator \
   --send=yes \
