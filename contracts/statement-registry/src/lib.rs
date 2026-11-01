@@ -8,6 +8,7 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Vec};
 
 mod error;
 mod event;
+mod leaf;
 mod merkle;
 mod price_book;
 mod storage;
@@ -16,6 +17,7 @@ mod types;
 
 use error::Error;
 use event::{AnchorEvent, DisputeEvent, ResolveEvent};
+use leaf::UsageRecord;
 use types::{Dispute, Protocol, Statement, Status};
 
 #[contract]
@@ -199,6 +201,67 @@ impl StatementRegistry {
             return Err(Error::ProofTooLong);
         }
         let statement = storage::get_statement(&env, &operator, seq).ok_or(Error::NotFound)?;
+        let root = merkle::fold(&env, leaf, &proof);
+        Ok(root == statement.usage_root)
+    }
+
+    /// Verifies a single billed request against the statement anchored at
+    /// (`operator`, `seq`), deriving the leaf from `record` itself rather
+    /// than taking the collector's word for it. No auth — anyone can check
+    /// a charge, and that is the whole point.
+    ///
+    /// This is the function an invoice line is checked with.
+    /// `verify_usage` answers a narrower question: it takes an opaque
+    /// 32-byte leaf and only says whether that leaf is in the tree, which
+    /// leaves the caller trusting whoever computed the leaf — including on
+    /// how the amount and the price version were encoded into it. Here the
+    /// contract computes the leaf from the record's own fields and then
+    /// binds the record to the statement it is claimed to belong to:
+    ///
+    /// - `record.consumer` must be the statement's `consumer`, so a line
+    ///   billed to someone else cannot be passed off as part of this bill;
+    /// - `record.price_v` must be the statement's `price_book_version`,
+    ///   which is the version `anchor()` already proved was the one in
+    ///   force across the whole period — so a line priced against any
+    ///   other schedule is rejected here rather than silently accepted;
+    /// - `record.ledger` must fall inside `[period_start, period_end]`, so
+    ///   a request from a different period cannot be counted in this one.
+    ///
+    /// Together with `anchor()`'s price check, that is the full chain a
+    /// buyer needs: this request, at this price version, inside this
+    /// period, under a schedule the price book agrees was in force then.
+    ///
+    /// Returns `Ok(false)` — not an error — when the record is consistent
+    /// with the statement but its proof does not reach `usage_root`: that
+    /// is a well-formed claim that simply is not in the tree. Errors are
+    /// reserved for input that contradicts the statement outright, where
+    /// `false` would under-report what is wrong.
+    ///
+    /// Errors: `ProofTooLong`, `NotFound`, `RecordConsumerMismatch`,
+    /// `RecordPriceMismatch`, `RecordOutsidePeriod`.
+    pub fn verify_charge(
+        env: Env,
+        operator: Address,
+        seq: u64,
+        record: UsageRecord,
+        proof: Vec<BytesN<32>>,
+    ) -> Result<bool, Error> {
+        if proof.len() > storage::MAX_PROOF_NODES {
+            return Err(Error::ProofTooLong);
+        }
+        let statement = storage::get_statement(&env, &operator, seq).ok_or(Error::NotFound)?;
+
+        if record.consumer != statement.consumer {
+            return Err(Error::RecordConsumerMismatch);
+        }
+        if record.price_v != statement.price_book_version {
+            return Err(Error::RecordPriceMismatch);
+        }
+        if record.ledger < statement.period_start || record.ledger > statement.period_end {
+            return Err(Error::RecordOutsidePeriod);
+        }
+
+        let leaf = leaf::leaf_hash(&env, &record);
         let root = merkle::fold(&env, leaf, &proof);
         Ok(root == statement.usage_root)
     }

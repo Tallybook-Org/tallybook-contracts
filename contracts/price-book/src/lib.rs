@@ -120,6 +120,44 @@ impl PriceBook {
         storage::get_latest(&env, &operator).ok_or(Error::NotFound)
     }
 
+    /// Extends the TTL of `operator`'s published `version` — and of the
+    /// timeline that places it in time — out to `ledgers` from now,
+    /// clamped to a sane maximum.
+    ///
+    /// No auth, intentionally, and for the same reason
+    /// `statement_registry::extend_statement_ttl` has none: anyone may pay
+    /// rent to keep an audit record alive. Here that reason is load
+    /// bearing rather than merely convenient. A statement is only
+    /// falsifiable while the price evidence it names is still readable —
+    /// `Version` holds the schedule hash and URI the amounts were priced
+    /// against, and `Timeline` is what `version_at()` searches to confirm
+    /// independently which version was in force on the day. Before this
+    /// function existed the only writer that touched either key was
+    /// `publish()`, which requires the operator's auth; an operator who
+    /// has stopped publishing never calls it again, so the registry's
+    /// statements could be kept alive indefinitely by a stranger while the
+    /// prices they depend on were left to archive. Do not "fix" this by
+    /// adding auth.
+    ///
+    /// The timeline is extended alongside the version rather than on its
+    /// own call: extending one without the other leaves an audit record
+    /// that is half readable, which is not a state worth offering.
+    ///
+    /// Errors: `NotFound` if `operator` has no such published version.
+    pub fn extend_version_ttl(
+        env: Env,
+        operator: Address,
+        version: u32,
+        ledgers: u32,
+    ) -> Result<(), Error> {
+        storage::get_version(&env, &operator, version).ok_or(Error::NotFound)?;
+
+        storage::extend_version_ttl_to(&env, &operator, version, ledgers);
+        storage::extend_timeline_ttl_to(&env, &operator, ledgers);
+
+        Ok(())
+    }
+
     /// Returns which version of `operator`'s price schedule was in force at
     /// `ledger`: the version with the highest `effective_ledger` not
     /// exceeding `ledger`. No auth — read-only. This is the function

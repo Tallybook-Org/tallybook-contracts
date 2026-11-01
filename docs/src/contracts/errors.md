@@ -23,7 +23,7 @@ both enums as a record of that decision.
 | Discriminant | Variant | Raised by | Meaning |
 |---|---|---|---|
 | 1 | *(unused)* | — | See above. |
-| 2 | `NotFound` | `get_version`, `latest`, `version_at` | No such version, or the operator has never published. |
+| 2 | `NotFound` | `get_version`, `latest`, `version_at`, `extend_version_ttl` | No such version, or the operator has never published. |
 | 3 | `EffectiveInPast` | `publish` | `effective_ledger` is before the current ledger. |
 | 4 | `EffectiveNotAfter` | `publish` | `effective_ledger` doesn't strictly exceed the previous version's `effective_ledger`. |
 | 5 | `TimelineFull` | `publish` | `TIMELINE_CAP` (256 entries) reached for this operator. |
@@ -34,7 +34,7 @@ both enums as a record of that decision.
 | Discriminant | Variant | Raised by | Meaning |
 |---|---|---|---|
 | 1 | *(unused)* | — | See above. |
-| 2 | `NotFound` | `get_statement`, `get_dispute`, `open_dispute`, `resolve_dispute`, `verify_usage`, `extend_statement_ttl` | No such statement or dispute exists, or (for `open_dispute`) a real statement exists but the caller isn't its `consumer`. |
+| 2 | `NotFound` | `get_statement`, `get_dispute`, `open_dispute`, `resolve_dispute`, `verify_usage`, `verify_charge`, `extend_statement_ttl` | No such statement or dispute exists, or (for `open_dispute`) a real statement exists but the caller isn't its `consumer`. |
 | 3 | `BadPeriod` | `anchor` | `period_start >= period_end`, or `period_end` is after the current ledger. |
 | 4 | `BadAmounts` | `anchor` | A negative `amount_billed`/`amount_settled`, or `amount_settled > amount_billed`. |
 | 5 | `EmptyStatement` | `anchor` | `request_count == 0`. |
@@ -45,8 +45,11 @@ both enums as a record of that decision.
 | 10 | `NotAnchored` | `open_dispute` | The statement isn't currently `Anchored`. |
 | 11 | `NotDisputed` | `resolve_dispute` | The statement isn't currently `Disputed`. |
 | 12 | `CreditTooLarge` | `resolve_dispute` | `amount_credited` is negative or exceeds the statement's `amount_billed`. |
-| 13 | `ProofTooLong` | `verify_usage` | The proof has more than `MAX_PROOF_NODES` (32) entries. |
+| 13 | `ProofTooLong` | `verify_usage`, `verify_charge` | The proof has more than `MAX_PROOF_NODES` (32) entries. |
 | 14 | `PeriodSpansPriceChange` | `anchor` | `version_at(period_start) != version_at(period_end)` — the schedule changed partway through the period, so no single `price_book_version` honestly covers the whole statement. Distinct from `PriceVersionStale`, which is about the claimed version not matching what was in force; this is about the period itself straddling a change, independent of what was claimed. See [Pricing](../protocol/pricing.md). |
+| 15 | `RecordConsumerMismatch` | `verify_charge` | The record's `consumer` isn't the statement's, so the record was never part of this bill whatever the proof shows. |
+| 16 | `RecordPriceMismatch` | `verify_charge` | The record's `price_v` isn't the statement's `price_book_version` — the line was priced against a schedule the statement doesn't claim to have been billed under. |
+| 17 | `RecordOutsidePeriod` | `verify_charge` | The record's `ledger` falls outside `[period_start, period_end]`, so it belongs to a different billing period. |
 
 `list_statements` returns `Result<Vec<u64>, Error>` for interface consistency with
 the rest of the contract, but it can't actually fail — an unknown `(operator,

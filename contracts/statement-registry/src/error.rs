@@ -43,4 +43,16 @@ pub enum Error {
     /// matching what was in force — this is about the period itself
     /// straddling a change, independent of what was claimed.
     PeriodSpansPriceChange = 14,
+    /// `verify_charge`: the record's `consumer` is not the statement's
+    /// consumer, so the record was never part of this bill whatever the
+    /// proof shows.
+    RecordConsumerMismatch = 15,
+    /// `verify_charge`: the record's `price_v` is not the statement's
+    /// `price_book_version`, so the line was priced against a schedule
+    /// the statement does not claim to have been billed under.
+    RecordPriceMismatch = 16,
+    /// `verify_charge`: the record's `ledger` falls outside
+    /// `[period_start, period_end]`, so it belongs to a different
+    /// billing period.
+    RecordOutsidePeriod = 17,
 }

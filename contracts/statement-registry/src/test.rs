@@ -4,7 +4,7 @@
 // for building throwaway data like the leaf array below.
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, String};
+use soroban_sdk::{testutils::Address as _, xdr::ToXdr as _, Address, Bytes, BytesN, Env, String};
 
 use crate::{Error, StatementRegistry};
 
@@ -16,6 +16,15 @@ fn hash_pair(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
     let mut concatenated = Bytes::from(lo.clone());
     concatenated.append(&Bytes::from(hi.clone()));
     env.crypto().sha256(&concatenated).to_bytes()
+}
+
+/// Parses a 64-character hex string from a fixture into a BytesN<32>.
+fn hex_to_bytesn(env: &Env, hex: &str) -> BytesN<32> {
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    BytesN::from_array(env, &bytes)
 }
 
 /// Registers a fresh, real price_book contract (never mocked — the whole
@@ -707,14 +716,6 @@ mod verify_usage {
     use crate::StatementRegistryClient;
 
     use super::*;
-
-    fn hex_to_bytesn(env: &Env, hex: &str) -> BytesN<32> {
-        let mut bytes = [0u8; 32];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
-        }
-        BytesN::from_array(env, &bytes)
-    }
 
     /// Anchors a minimal, otherwise-valid statement with `usage_root` and
     /// returns (Env, contract_id, operator, seq) for verify_usage calls
@@ -1592,5 +1593,693 @@ mod integration {
         assert_eq!(dispute.resolution_hash, Some(resolution_hash));
         assert_eq!(dispute.amount_credited, 400);
         assert!(dispute.resolved_ledger.is_some());
+    }
+}
+
+/// The record -> leaf derivation, which is the half of the merkle format
+/// the `fixtures/merkle/*-leaves.json` trees never touch: those fixtures
+/// start from leaves that are already hashes, so they prove `fold` agrees
+/// across repos while saying nothing about how a billed request becomes a
+/// leaf in the first place. `fixtures/merkle/records.json` covers that
+/// half, and the collector in the `tallybook` repo tests its own encoder
+/// (`internal/merkle/leaf.go`) against the same file.
+mod leaf {
+    use super::*;
+    use crate::leaf::{leaf_hash, UsageRecord};
+    use std::{format, fs, string::String as StdString, vec, vec::Vec as StdVec};
+
+    /// Where the fixture lives, relative to this crate rather than to the
+    /// working directory a test happens to be run from.
+    const FIXTURE_PATH: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/merkle/records.json");
+
+    fn hex(bytes: &[u8]) -> StdString {
+        let mut out = StdString::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+
+    /// One vector's inputs, in the form a collector would have them before
+    /// encoding: a method and path template rather than an endpoint hash.
+    struct Vector {
+        label: &'static str,
+        method: &'static str,
+        path: &'static str,
+        amount: i128,
+        consumer: &'static str,
+        ledger: u32,
+        price_v: u32,
+        reqid: [u8; 32],
+        units: u64,
+    }
+
+    /// Fixed addresses, derived from fixed 32-byte payloads (0x11.., 0x22..,
+    /// 0x33..) so the strkeys are reproducible from the raw bytes on either
+    /// side of the repo boundary rather than copied on trust.
+    const ACCOUNT_A: &str = "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M";
+    const ACCOUNT_B: &str = "GARCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCFRVX";
+    const CHANNEL_CONTRACT: &str = "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH";
+
+    fn vectors() -> StdVec<Vector> {
+        vec![
+            // The floor case: one unit, one stroop, lowest sensible ledger.
+            Vector {
+                label: "minimal",
+                method: "GET",
+                path: "/v1/search",
+                amount: 1,
+                consumer: ACCOUNT_A,
+                ledger: 1,
+                price_v: 1,
+                reqid: [0u8; 32],
+                units: 1,
+            },
+            // What the overwhelming majority of real records look like:
+            // a single request at 0.01 USDC, which is 100_000 in USDC's
+            // seven-decimal smallest unit.
+            Vector {
+                label: "typical x402 request at 0.01 usdc",
+                method: "GET",
+                path: "/v1/search",
+                amount: 100_000,
+                consumer: ACCOUNT_A,
+                ledger: 58_123_456,
+                price_v: 3,
+                reqid: [0xab; 32],
+                units: 1,
+            },
+            // A negative amount: a credit line on a resolved dispute. This
+            // is the vector that catches a two's-complement bug in an
+            // i128 encoder, which is the most likely place for the two
+            // implementations to diverge without anyone noticing.
+            Vector {
+                label: "credit line, negative amount",
+                method: "POST",
+                path: "/v1/embed",
+                amount: -100_000,
+                consumer: ACCOUNT_B,
+                ledger: 58_123_457,
+                price_v: 3,
+                reqid: [0x01; 32],
+                units: 1,
+            },
+            // MPP session mode, where `consumer` is the channel contract
+            // (`C…`) and not an account (`G…`). An encoder that only
+            // handles account strkeys fails outright on this one.
+            Vector {
+                label: "mpp session, channel contract consumer",
+                method: "GET",
+                path: "/v1/stream",
+                amount: 250,
+                consumer: CHANNEL_CONTRACT,
+                ledger: 58_200_000,
+                price_v: 4,
+                reqid: [0x7f; 32],
+                units: 5,
+            },
+            // Both ends of the i128 range, plus the u32 and u64 ceilings,
+            // so the Hi/Lo split of an i128 and the full width of every
+            // other field are pinned rather than assumed.
+            Vector {
+                label: "i128 max and field ceilings",
+                method: "GET",
+                path: "/v1/search",
+                amount: i128::MAX,
+                consumer: ACCOUNT_A,
+                ledger: u32::MAX,
+                price_v: u32::MAX,
+                reqid: [0xff; 32],
+                units: u64::MAX,
+            },
+            Vector {
+                label: "i128 min and field floors",
+                method: "GET",
+                path: "/v1/search",
+                amount: i128::MIN,
+                consumer: ACCOUNT_B,
+                ledger: 0,
+                price_v: 0,
+                reqid: [0x00; 32],
+                units: 0,
+            },
+        ]
+    }
+
+    /// `sha256(method || " " || path_template)`, the record's `endpoint`
+    /// field. The collector derives the same value for its pricing lookup,
+    /// so it is pinned here too rather than left to the caller.
+    fn endpoint_hash(env: &Env, method: &str, path: &str) -> BytesN<32> {
+        let mut bytes = Bytes::new(env);
+        bytes.extend_from_slice(method.as_bytes());
+        bytes.extend_from_slice(b" ");
+        bytes.extend_from_slice(path.as_bytes());
+        env.crypto().sha256(&bytes).to_bytes()
+    }
+
+    fn rendered_fixture(env: &Env) -> StdString {
+        let mut records = StdVec::new();
+        for v in vectors() {
+            let endpoint = endpoint_hash(env, v.method, v.path);
+            let record = UsageRecord {
+                amount: v.amount,
+                consumer: Address::from_str(env, v.consumer),
+                endpoint: endpoint.clone(),
+                ledger: v.ledger,
+                price_v: v.price_v,
+                reqid: BytesN::from_array(env, &v.reqid),
+                units: v.units,
+            };
+            // `record_bytes` is carried alongside the leaf so a mismatch
+            // on the other side of the repo boundary localises itself: if
+            // record_bytes differs the encoding drifted, if only the leaf
+            // differs the hashing did.
+            let record_bytes = record.clone().to_xdr(env);
+            let mut raw = std::vec![0u8; record_bytes.len() as usize];
+            record_bytes.copy_into_slice(&mut raw);
+
+            records.push(serde_json::json!({
+                "label": v.label,
+                "endpoint_method": v.method,
+                "endpoint_path": v.path,
+                "amount": format!("{}", v.amount),
+                "consumer": v.consumer,
+                "endpoint": hex(&endpoint.to_array()),
+                "ledger": v.ledger,
+                "price_v": v.price_v,
+                "reqid": hex(&v.reqid),
+                "units": v.units,
+                "record_bytes": hex(&raw),
+                "leaf": hex(&leaf_hash(env, &record).to_array()),
+            }));
+        }
+
+        let doc = serde_json::json!({
+            "format": "XDR(ScVal::Map) over symbol keys sorted alphabetically, then leaf = sha256(sha256(record_bytes))",
+            "records": records,
+        });
+        serde_json::to_string_pretty(&doc).expect("serialize fixture")
+    }
+
+    /// Regenerate with `TALLYBOOK_WRITE_FIXTURES=1 cargo test -p
+    /// statement-registry record_vectors`. Without that variable the test
+    /// only compares, so the committed file cannot drift from the code
+    /// that produced it without CI failing.
+    #[test]
+    fn record_vectors_match_the_committed_fixture() {
+        let env = Env::default();
+        let rendered = rendered_fixture(&env);
+
+        if std::env::var("TALLYBOOK_WRITE_FIXTURES").is_ok() {
+            fs::write(FIXTURE_PATH, format!("{rendered}\n")).expect("write fixture");
+            return;
+        }
+
+        let committed = fs::read_to_string(FIXTURE_PATH).expect("read fixture");
+        assert_eq!(
+            committed.trim_end(),
+            rendered.trim_end(),
+            "fixtures/merkle/records.json is out of sync with the leaf derivation that produced it"
+        );
+    }
+
+    /// The leaf format's double hash is what keeps a leaf out of the
+    /// folding domain, so it is asserted directly rather than inferred
+    /// from the fixture: a leaf must be sha256 of the sha256 of the
+    /// record, never the single hash.
+    #[test]
+    fn leaf_is_the_double_hash_of_the_record_bytes() {
+        let env = Env::default();
+        let record = UsageRecord {
+            amount: 100_000,
+            consumer: Address::from_str(&env, ACCOUNT_A),
+            endpoint: endpoint_hash(&env, "GET", "/v1/search"),
+            ledger: 58_123_456,
+            price_v: 3,
+            reqid: BytesN::from_array(&env, &[0xab; 32]),
+            units: 1,
+        };
+
+        let record_bytes = record.clone().to_xdr(&env);
+        let single = env.crypto().sha256(&record_bytes).to_bytes();
+        let double = env.crypto().sha256(&Bytes::from(single.clone())).to_bytes();
+
+        assert_eq!(leaf_hash(&env, &record), double);
+        assert_ne!(leaf_hash(&env, &record), single);
+    }
+}
+
+mod verify_charge {
+    use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::{vec, Vec as SorobanVec};
+    use std::vec::Vec as StdVec;
+
+    use crate::leaf::{leaf_hash, UsageRecord};
+    use crate::types::Protocol;
+    use crate::{StatementRegistry, StatementRegistryClient};
+
+    use super::*;
+
+    /// A statement anchored over a real four-leaf tree of derived records,
+    /// with everything a verify_charge call needs to be checked against it.
+    struct Anchored {
+        env: Env,
+        contract_id: Address,
+        operator: Address,
+        seq: u64,
+        version: u32,
+        period_start: u32,
+        period_end: u32,
+        records: StdVec<UsageRecord>,
+        proofs: StdVec<SorobanVec<BytesN<32>>>,
+    }
+
+    /// Folds four leaves into a balanced tree and returns its root plus one
+    /// proof per leaf. Built with `hash_pair`, the reference pair hash, so
+    /// the tree under test never shares logic with `merkle::fold`.
+    fn four_leaf_tree(
+        env: &Env,
+        leaves: &[BytesN<32>; 4],
+    ) -> (BytesN<32>, StdVec<SorobanVec<BytesN<32>>>) {
+        let left = hash_pair(env, &leaves[0], &leaves[1]);
+        let right = hash_pair(env, &leaves[2], &leaves[3]);
+        let root = hash_pair(env, &left, &right);
+        let proofs = std::vec![
+            vec![env, leaves[1].clone(), right.clone()],
+            vec![env, leaves[0].clone(), right],
+            vec![env, leaves[3].clone(), left.clone()],
+            vec![env, leaves[2].clone(), left],
+        ];
+        (root, proofs)
+    }
+
+    /// Anchors a statement over four records billed to one consumer inside
+    /// one price version's window — the shape an honest period has.
+    fn anchored() -> Anchored {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let price_book_admin = Address::generate(&env);
+        let price_book_id = env.register(crate::price_book::WASM, (price_book_admin,));
+        let contract_id = env.register(StatementRegistry, (admin, price_book_id.clone()));
+        env.mock_all_auths();
+
+        let operator = Address::generate(&env);
+        let consumer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Start the period off ledger 0 so a test can name a ledger
+        // before period_start without underflowing.
+        env.ledger().set_sequence_number(1_000);
+        let period_start = env.ledger().sequence();
+        let version = publish_schedule(&env, &price_book_id, &operator, period_start);
+        let period_end = period_start + 50;
+        env.ledger().set_sequence_number(period_end + 10);
+
+        let mut records = StdVec::new();
+        for i in 0u8..4 {
+            records.push(UsageRecord {
+                amount: 100_000 + i128::from(i),
+                consumer: consumer.clone(),
+                endpoint: BytesN::from_array(&env, &[0x10 + i; 32]),
+                ledger: period_start + 1 + u32::from(i),
+                price_v: version,
+                reqid: BytesN::from_array(&env, &[0x20 + i; 32]),
+                units: 1,
+            });
+        }
+        let leaves = [
+            leaf_hash(&env, &records[0]),
+            leaf_hash(&env, &records[1]),
+            leaf_hash(&env, &records[2]),
+            leaf_hash(&env, &records[3]),
+        ];
+        let (root, proofs) = four_leaf_tree(&env, &leaves);
+
+        let client = StatementRegistryClient::new(&env, &contract_id);
+        let seq = client.anchor(
+            &operator,
+            &consumer,
+            &period_start,
+            &period_end,
+            &root,
+            &4,
+            &token,
+            &400_006i128,
+            &400_006i128,
+            &version,
+            &Protocol::X402,
+            &None,
+        );
+
+        Anchored {
+            env,
+            contract_id,
+            operator,
+            seq,
+            version,
+            period_start,
+            period_end,
+            records,
+            proofs,
+        }
+    }
+
+    #[test]
+    fn happy_path_verifies_every_record_in_the_tree() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        for (i, record) in a.records.iter().enumerate() {
+            assert!(
+                client.verify_charge(&a.operator, &a.seq, record, &a.proofs[i]),
+                "record {i} should verify against the anchored root"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_no_auth() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        // Strict enforcement with zero valid auth entries: a buyer
+        // checking a charge is not a party to anything and must not need
+        // to be.
+        a.env.mock_auths(&[]);
+        assert!(client.verify_charge(&a.operator, &a.seq, &a.records[0], &a.proofs[0]));
+    }
+
+    #[test]
+    fn a_record_the_contract_derives_differently_returns_false() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        // Consistent with the statement on every bound field — same
+        // consumer, same price version, a ledger inside the period — but
+        // the amount was altered, so the leaf the contract derives is not
+        // the leaf that went into the tree. This is the case the old
+        // verify_usage could not catch: handed a leaf computed from the
+        // altered amount it would have folded it happily, and handed the
+        // honest leaf it would have returned true while the caller read
+        // the altered amount off the invoice.
+        let mut tampered = a.records[0].clone();
+        tampered.amount += 1;
+        assert!(!client.verify_charge(&a.operator, &a.seq, &tampered, &a.proofs[0]));
+    }
+
+    #[test]
+    fn a_record_from_another_leaf_position_returns_false() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+        assert!(!client.verify_charge(&a.operator, &a.seq, &a.records[0], &a.proofs[1]));
+    }
+
+    #[test]
+    fn record_consumer_mismatch_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut other = a.records[0].clone();
+        other.consumer = Address::generate(&a.env);
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &other, &a.proofs[0]),
+            Err(Ok(Error::RecordConsumerMismatch))
+        );
+    }
+
+    #[test]
+    fn record_price_mismatch_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut other = a.records[0].clone();
+        other.price_v = a.version + 1;
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &other, &a.proofs[0]),
+            Err(Ok(Error::RecordPriceMismatch))
+        );
+    }
+
+    #[test]
+    fn record_before_period_start_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut other = a.records[0].clone();
+        other.ledger = a.period_start - 1;
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &other, &a.proofs[0]),
+            Err(Ok(Error::RecordOutsidePeriod))
+        );
+    }
+
+    #[test]
+    fn record_after_period_end_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut other = a.records[0].clone();
+        other.ledger = a.period_end + 1;
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &other, &a.proofs[0]),
+            Err(Ok(Error::RecordOutsidePeriod))
+        );
+    }
+
+    #[test]
+    fn a_record_on_the_period_boundaries_is_accepted() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        // period_start and period_end are both inclusive, so a record on
+        // either boundary is in the period. These two fail the membership
+        // check rather than the bounds check — Ok(false), not an error —
+        // which is exactly how an in-period record that isn't in the tree
+        // should read.
+        for ledger in [a.period_start, a.period_end] {
+            let mut edge = a.records[0].clone();
+            edge.ledger = ledger;
+            assert_eq!(
+                client.try_verify_charge(&a.operator, &a.seq, &edge, &a.proofs[0]),
+                Ok(Ok(false))
+            );
+        }
+    }
+
+    #[test]
+    fn proof_too_long_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut proof = vec![&a.env];
+        for _ in 0..=crate::storage::MAX_PROOF_NODES {
+            proof.push_back(BytesN::from_array(&a.env, &[0u8; 32]));
+        }
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &a.records[0], &proof),
+            Err(Ok(Error::ProofTooLong))
+        );
+    }
+
+    #[test]
+    fn not_found_for_missing_statement() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &(a.seq + 1), &a.records[0], &a.proofs[0]),
+            Err(Ok(Error::NotFound))
+        );
+    }
+}
+
+/// Properties of `merkle::fold` that a fixed fixture cannot express: that it
+/// agrees with an independently built tree, and that the root it reaches
+/// does not depend on which leaf the proof started from.
+///
+/// Randomised with a fixed-seed LCG rather than a property-testing crate.
+/// The generator is eight lines and runs the same sequence on every machine
+/// and in CI; a dependency would buy shrinking and cost this workspace a new
+/// crate in a repo that pins `soroban-sdk` to an exact patch version on
+/// purpose. A failure here reproduces from the seed printed in the
+/// assertion message.
+mod merkle_properties {
+    use std::vec::Vec as StdVec;
+
+    use soroban_sdk::vec;
+
+    use super::*;
+
+    /// Numerical Recipes' LCG constants. Deterministic, seeded per case, and
+    /// only ever used to pick tree shapes and leaf bytes.
+    struct Lcg(u32);
+
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            self.0
+        }
+
+        fn below(&mut self, bound: u32) -> u32 {
+            self.next_u32() % bound
+        }
+
+        fn leaf(&mut self, env: &Env) -> BytesN<32> {
+            let mut bytes = [0u8; 32];
+            for chunk in bytes.chunks_mut(4) {
+                chunk.copy_from_slice(&self.next_u32().to_be_bytes());
+            }
+            BytesN::from_array(env, &bytes)
+        }
+    }
+
+    /// Builds the tree the collector builds, independently of `merkle::fold`:
+    /// pair each level up with `hash_pair`, promoting a lone trailing node
+    /// unchanged to the next level. Returns the root and one proof per leaf,
+    /// in leaf order.
+    fn reference_tree(
+        env: &Env,
+        leaves: &[BytesN<32>],
+    ) -> (BytesN<32>, StdVec<soroban_sdk::Vec<BytesN<32>>>) {
+        assert!(!leaves.is_empty(), "a tree needs at least one leaf");
+
+        let mut proofs: StdVec<soroban_sdk::Vec<BytesN<32>>> =
+            leaves.iter().map(|_| vec![env]).collect();
+        // Which level-node each leaf currently sits under, so a sibling can
+        // be appended to the right proofs as the levels collapse.
+        let mut owners: StdVec<StdVec<usize>> = (0..leaves.len()).map(|i| std::vec![i]).collect();
+        let mut level: StdVec<BytesN<32>> = leaves.to_vec();
+
+        while level.len() > 1 {
+            let mut next_level = StdVec::new();
+            let mut next_owners: StdVec<StdVec<usize>> = StdVec::new();
+
+            let mut i = 0;
+            while i < level.len() {
+                if i + 1 == level.len() {
+                    // Lone trailing node: promoted unchanged, no proof entry.
+                    next_level.push(level[i].clone());
+                    next_owners.push(owners[i].clone());
+                    break;
+                }
+
+                for leaf_idx in &owners[i] {
+                    proofs[*leaf_idx].push_back(level[i + 1].clone());
+                }
+                for leaf_idx in &owners[i + 1] {
+                    proofs[*leaf_idx].push_back(level[i].clone());
+                }
+
+                next_level.push(hash_pair(env, &level[i], &level[i + 1]));
+                let mut merged = owners[i].clone();
+                merged.extend_from_slice(&owners[i + 1]);
+                next_owners.push(merged);
+                i += 2;
+            }
+
+            level = next_level;
+            owners = next_owners;
+        }
+
+        (level[0].clone(), proofs)
+    }
+
+    /// The reference builder is only a useful oracle if it reproduces the
+    /// roots both repos already committed to, so it is pinned against all
+    /// three tree fixtures before being trusted for random shapes.
+    #[test]
+    fn reference_builder_reproduces_the_committed_fixtures() {
+        let env = Env::default();
+        for json in [
+            include_str!("../../../fixtures/merkle/single-leaf.json"),
+            include_str!("../../../fixtures/merkle/four-leaves.json"),
+            include_str!("../../../fixtures/merkle/seven-leaves.json"),
+        ] {
+            let fixture: serde_json::Value = serde_json::from_str(json).unwrap();
+            let leaves: StdVec<BytesN<32>> = fixture["leaves"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|leaf| hex_to_bytesn(&env, leaf.as_str().unwrap()))
+                .collect();
+            let expected_root = hex_to_bytesn(&env, fixture["root"].as_str().unwrap());
+
+            let (root, proofs) = reference_tree(&env, &leaves);
+            assert_eq!(root, expected_root, "reference tree root differs from the fixture");
+
+            // And the proofs it derives must match the committed ones, not
+            // merely fold to the same root.
+            for entry in fixture["proofs"].as_array().unwrap() {
+                let leaf = hex_to_bytesn(&env, entry["leaf"].as_str().unwrap());
+                let position = leaves.iter().position(|l| *l == leaf).unwrap();
+                let committed: StdVec<BytesN<32>> = entry["proof"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|node| hex_to_bytesn(&env, node.as_str().unwrap()))
+                    .collect();
+                let derived: StdVec<BytesN<32>> = proofs[position].iter().collect();
+                assert_eq!(
+                    derived, committed,
+                    "proof for leaf {position} differs from the fixture"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_reaches_the_reference_root_from_every_leaf() {
+        let env = Env::default();
+
+        for seed in 0..64u32 {
+            let mut rng = Lcg(seed.wrapping_mul(2_654_435_761).wrapping_add(1));
+            // 1..=24 leaves, which covers both parities at every level and
+            // the lone-trailing-node case at several depths.
+            let leaf_count = rng.below(24) + 1;
+            let leaves: StdVec<BytesN<32>> = (0..leaf_count).map(|_| rng.leaf(&env)).collect();
+
+            let (root, proofs) = reference_tree(&env, &leaves);
+
+            for (i, leaf) in leaves.iter().enumerate() {
+                assert_eq!(
+                    crate::merkle::fold(&env, leaf.clone(), &proofs[i]),
+                    root,
+                    "seed {seed}: leaf {i} of {leaf_count} folded to a different root"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_rejects_a_corrupted_proof_node() {
+        let env = Env::default();
+
+        for seed in 0..64u32 {
+            let mut rng = Lcg(seed.wrapping_mul(40_503).wrapping_add(7));
+            // At least two leaves, so every leaf has a non-empty proof to
+            // corrupt.
+            let leaf_count = rng.below(23) + 2;
+            let leaves: StdVec<BytesN<32>> = (0..leaf_count).map(|_| rng.leaf(&env)).collect();
+            let (root, proofs) = reference_tree(&env, &leaves);
+
+            let target = rng.below(leaf_count) as usize;
+            let proof = &proofs[target];
+            let corrupt_at = rng.below(proof.len()) as usize;
+
+            let mut corrupted = vec![&env];
+            for (i, node) in proof.iter().enumerate() {
+                if i == corrupt_at {
+                    corrupted.push_back(rng.leaf(&env));
+                } else {
+                    corrupted.push_back(node);
+                }
+            }
+
+            assert_ne!(
+                crate::merkle::fold(&env, leaves[target].clone(), &corrupted),
+                root,
+                "seed {seed}: corrupting node {corrupt_at} of leaf {target}'s proof still reached the root"
+            );
+        }
     }
 }

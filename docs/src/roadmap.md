@@ -3,27 +3,39 @@
 ## What exists
 
 Both contracts — `price_book` and `statement_registry` — are complete, tested, and
-deployed to testnet. See [Contracts](contracts/overview.md) for the addresses and
-[How it works](how-it-works.md) for exactly which of the five settlement steps they
-cover (anchoring and verification) versus which are still planned.
+deployed to testnet. `price_book.extend_version_ttl` and
+`statement_registry.verify_charge` were added after the `v0.1.0` deploy and are not
+live at the published addresses yet. See [Contracts](contracts/overview.md) for the
+addresses, and [How it works](how-it-works.md) for which of the five settlement steps
+these two contracts cover (anchoring and verification) and where the other three run.
 
-## Planned: the off-chain layer
+## The off-chain layer, in a separate repository
 
-Nothing below this line exists in this repository, or anywhere else yet. Each is a
-sentence on what it will do, not a commitment to a date.
+None of this is in this repository, and none of it is planned *for* this repository.
+It lives in [`Tallybook-Org/tallybook`](https://github.com/Tallybook-Org/tallybook),
+which consumes these two contracts' deployed interfaces — contract IDs by environment
+variable — and vendors or forks none of their code. Three services sharing one
+Postgres database:
 
-- **Collector.** Meters requests against an operator's published schedule and builds
-  the merkle tree — leaves, proof generation, the works — that `anchor()` commits to.
-- **Settler.** Holds signed payment-channel commitments as they arrive in MPP session
-  mode, and submits the latest one to the channel contract before the funder's refund
-  window closes — the step that actually closes the gap described in
-  [The problem](problem.md).
-- **Indexer.** Independently sums real SAC transfer and channel events per period and
-  flags any mismatch against a statement's `amount_settled` claim — the check this
-  contract deliberately doesn't perform on-chain.
-- **Dashboard.** Reads all of the above plus the two contracts directly, so an
-  operator or a buyer can see a period's statement, its dispute status, and its
-  reconciliation state without running any commands themselves.
+- **Collector** (`cmd/collector`, `internal/meter`, `internal/httpapi`,
+  `internal/custody`). An HTTP metering layer that wraps a paid API, prices each
+  request against the operator's published schedule, builds the merkle tree `anchor()`
+  commits to (`internal/merkle`), and holds custody of payment-channel commitments.
+- **Settler** (`cmd/settler`, `internal/settle`). Watches open channels and sweeps
+  earned revenue on chain before the payer can reclaim it — the step that closes the
+  gap described in [The problem](problem.md).
+- **Indexer** (`cmd/indexer`, `internal/indexer`). Ingests Soroban events into
+  Postgres so metered usage can be reconciled against what actually settled, which is
+  the independent check on a statement's `amount_settled` claim that this contract
+  deliberately doesn't attempt on-chain.
+
+The merkle tree builder there and `leaf.rs` here have to agree byte for byte. Both
+repositories commit the same `fixtures/merkle/` files and test against them; see
+[Merkle verification](contracts/merkle.md) for what each file pins.
+
+Still genuinely unbuilt: a **dashboard** over all of the above, so an operator or a
+buyer can read a period's statement, its dispute status and its reconciliation state
+without running any commands.
 
 ## Planned: consumer index bucketing
 

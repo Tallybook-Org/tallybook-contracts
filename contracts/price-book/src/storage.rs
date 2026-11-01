@@ -9,7 +9,9 @@ const BUMP_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
 /// ...and extend it out to this many ledgers of headroom. A year of
 /// headroom on a one-year bump is deliberate: these are audit records, and
 /// the cost of a rent bump is trivial next to an unreadable statement.
-const BUMP_AMOUNT: u32 = 365 * DAY_IN_LEDGERS;
+// pub: extend_version_ttl()'s clamp test needs the exact value to assert
+// against, rather than duplicating the literal independently in test.rs.
+pub const BUMP_AMOUNT: u32 = 365 * DAY_IN_LEDGERS;
 
 /// `version_at()` binary-searches `Timeline(operator)` rather than scanning
 /// every published `Version` key, so the vector is capped instead of left to
@@ -84,4 +86,30 @@ pub fn set_timeline(env: &Env, operator: &Address, timeline: &Vec<TimelineEntry>
     let key = DataKey::Timeline(operator.clone());
     env.storage().persistent().set(&key, timeline);
     env.storage().persistent().extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+}
+
+/// Extends `Version(operator, version)`'s TTL to `ledgers` from now
+/// (clamped to `BUMP_AMOUNT`, the same ceiling every other TTL bump in this
+/// contract uses), unless it is already extended at least that far —
+/// `extend_ttl`'s threshold and target are the same value on purpose, so
+/// this only ever extends, never shortens.
+pub fn extend_version_ttl_to(env: &Env, operator: &Address, version: u32, ledgers: u32) {
+    let extend_to = ledgers.min(BUMP_AMOUNT);
+    let key = DataKey::Version(operator.clone(), version);
+    env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
+}
+
+/// Extends `Timeline(operator)`'s TTL the same way. A published version is
+/// only evidence while the timeline that places it in time is still
+/// readable: `version_at()` answers "which schedule applied at ledger N"
+/// by binary-searching this vector, and with it archived a stored
+/// `PriceBookVersion` proves a schedule existed but not that it was the one
+/// in force. The two are extended together for that reason, never one
+/// alone.
+pub fn extend_timeline_ttl_to(env: &Env, operator: &Address, ledgers: u32) {
+    let key = DataKey::Timeline(operator.clone());
+    if env.storage().persistent().has(&key) {
+        let extend_to = ledgers.min(BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
+    }
 }

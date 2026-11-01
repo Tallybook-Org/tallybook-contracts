@@ -1,15 +1,24 @@
 # Merkle verification
 
-`statement_registry.verify_usage()` checks one usage record against an anchored
-`usage_root` by folding a leaf up through a proof. This page is precise enough to
-implement a compatible tree builder in another language — that's its job, since the
-off-chain collector that builds these trees does exactly that, in Go.
+`statement_registry` checks one usage record against an anchored `usage_root` by
+folding a leaf up through a proof. Two calls do it:
+`verify_charge` takes the record's fields and derives the leaf itself, and
+`verify_usage` takes a leaf already computed and only folds it. A buyer checking an
+invoice line wants `verify_charge`; `verify_usage` exists for callers that already
+hold a leaf and want nothing but the membership answer.
+
+This page is precise enough to implement a compatible tree builder in another
+language — that's its job, since the off-chain collector that builds these trees does
+exactly that, in Go.
 
 ## Leaf format
 
-The leaf itself is **not computed by the contract**. `verify_usage` receives a leaf
-and only folds it; the format below is fixed by the off-chain collector, documented
-here so the two sides can't drift apart:
+The format is implemented twice: here, in
+[`contracts/statement-registry/src/leaf.rs`](https://github.com/Tallybook-Org/tallybook-contracts/blob/main/contracts/statement-registry/src/leaf.rs),
+and in the off-chain collector's `internal/merkle/leaf.go` in the
+[`tallybook`](https://github.com/Tallybook-Org/tallybook) repo. The two must agree
+byte for byte or every proof the collector produces is invalid on chain, which is
+what the fixtures at the bottom of this page exist to prevent.
 
 ```
 record_bytes = XDR(ScVal::Map{           // keys sorted alphabetically
@@ -28,12 +37,28 @@ leaf = sha256(sha256(record_bytes))
 `ledger`, `price_v`, `reqid`, `units` — which matches the convention
 `stellar-experimental/one-way-channel` uses for its own commitments; that consistency
 is deliberate, not incidental. `endpoint` is a hash rather than the raw method and
-path so leaves stay a fixed size regardless of route length. The double `sha256`
-prevents a leaf from being passed off as an internal node: an attacker who wanted to
-claim some leaf was actually two children of the tree merged together would need a
-first-preimage of a single `sha256`, which double-hashing the leaf specifically rules
-out as a valid internal-node value (internal nodes are single-hashed pairs; a
-double-hashed leaf can't coincide with one without a genuine collision).
+path so leaves stay a fixed size regardless of route length, and so the path template
+itself stays off-chain.
+
+On the contract side none of that is hand-rolled. `UsageRecord` is a
+`#[contracttype]` struct whose fields are named and typed exactly as above, and the
+macro encodes a named-field struct as precisely that `ScVal::Map`, keyed by field
+names as symbols, sorted alphabetically. The type *is* the format — there is no
+separate encoder to drift from it.
+
+### Why the hash is applied twice
+
+Sorted-pair folding gives internal nodes no domain tag of their own, so leaves and
+internal nodes have to be separated some other way. Double-hashing does it by
+preimage length: an internal node is `sha256` of 64 bytes (two concatenated
+children), while a leaf is `sha256` of exactly 32 bytes (the first hash of the
+record). No record, whatever its length, produces a leaf whose preimage is a
+concatenated pair.
+
+Without that, a single-hashed 64-byte record would be indistinguishable from an
+internal node, and an internal node could be presented as a leaf and verified against
+the path above it. `verify_charge` removes the question entirely for its callers,
+since it derives the leaf from a record rather than accepting one.
 
 ## Sorted-pair folding
 
@@ -97,7 +122,37 @@ sibling is a well-formed 32-byte value, not malformed input, so it's not an erro
 
 ## Fixtures
 
-Three fixtures are committed under `fixtures/merkle/`: `single-leaf.json` (a
-degenerate one-node tree, empty proof), `four-leaves.json` (above), and
-`seven-leaves.json` — an unbalanced tree, deliberately included because unbalanced
-trees are where sorted-pair implementations most often diverge from each other.
+`fixtures/merkle/` is the contract test between the two implementations. Both repos
+commit the same files and test against them, and the two halves of the format are
+covered by different files.
+
+**Tree shape** — `single-leaf.json` (a degenerate one-node tree, empty proof),
+`four-leaves.json` (above), and `seven-leaves.json`, an unbalanced tree, deliberately
+included because unbalanced trees are where sorted-pair implementations most often
+diverge from each other. These pin how `fold` combines nodes. They start from leaves
+that are already hashes, so they say nothing about how a request becomes a leaf.
+
+**Leaf derivation** — `records.json` pins that other half: six records, each with its
+`record_bytes` and resulting leaf. Carrying `record_bytes` as well as the leaf makes a
+mismatch localise itself — `record_bytes` differing means the encoding drifted, only
+the leaf differing means the hashing did. The six are chosen for where two
+implementations actually diverge rather than for coverage of the happy path:
+
+| Vector | What it catches |
+|---|---|
+| minimal | The floor case: one unit, one stroop. |
+| typical x402 request at 0.01 USDC | The shape nearly every real record has. |
+| credit line, negative amount | An `i128` two's-complement bug, the likeliest silent divergence. |
+| MPP session, channel contract consumer | An encoder that only handles account (`G…`) strkeys and not a channel contract (`C…`). |
+| `i128` max and field ceilings | The Hi/Lo split of an `i128`, plus the `u32` and `u64` ceilings. |
+| `i128` min and field floors | The other end of the same range. |
+
+`records.json` is generated from this repo's implementation rather than written by
+hand:
+
+```sh
+TALLYBOOK_WRITE_FIXTURES=1 cargo test -p statement-registry record_vectors
+```
+
+Without that environment variable the same test only compares, so the committed file
+can't drift from the code that produced it without CI failing.

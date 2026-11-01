@@ -20,9 +20,12 @@ The system has two on-chain contracts and one off-chain layer:
 - **`statement_registry`** — anchors each billing period's statement against a merkle
   root of usage records, checks it against the price book, and lets a buyer dispute one
   publicly.
-- **An off-chain collector, sweeper, and indexer** — meters requests, submits
+- **An off-chain collector, settler, and indexer** — meters requests, submits
   payment-channel commitments before they expire, and reconciles on-chain transfers
-  against anchored statements. Planned, not part of this repository.
+  against anchored statements. Implemented in a separate repository,
+  [`Tallybook-Org/tallybook`](https://github.com/Tallybook-Org/tallybook), which
+  consumes these two contracts' deployed interfaces and vendors none of their code.
+  Not part of this repository, and not audited either.
 
 Continue to [The problem](problem.md) for why a settlement layer needs this on top of
 it.

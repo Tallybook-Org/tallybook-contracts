@@ -97,6 +97,29 @@ stellar contract invoke \
 Ledger `4,592,300` is before version `2`'s `effective_ledger` (`4,600,000`), so this
 correctly still returns `1` even though a newer version exists.
 
+### `extend_version_ttl`
+
+Not live at the address above: this was added after the `v0.1.0` deploy, so unlike
+every other call on this page there is no real run to quote. The shape is:
+
+```
+stellar contract invoke \
+  --id <price_book> \
+  --network testnet \
+  --source <any-identity> \
+  --send=yes \
+  -- extend_version_ttl \
+  --operator GDOLCHAOYP63BEHGAUJJS5IVQNUXLPBWCHO2HZRBTZRU52XBMW2TRJLM \
+  --version 1 \
+  --ledgers 6307200
+```
+
+Any identity, like `extend_statement_ttl` — and for a sharper reason. Keeping a
+statement readable is pointless if the price version it was billed under archives, so
+whoever pays rent for the statement needs to be able to pay it here too. `--ledgers`
+is clamped to `BUMP_AMOUNT` (6,307,200 ledgers, roughly a year), and the version and
+the operator's timeline are extended together.
+
 ## `statement_registry`
 
 ### `anchor`
@@ -149,6 +172,29 @@ true
 
 See [Verifying a charge](../guides/verifying-a-charge.md) for the full walkthrough,
 including the matching negative case.
+
+### `verify_charge`
+
+Also added after `v0.1.0`, so also not live at the address above. This is the call a
+buyer checking an invoice line should use; `verify_usage` above only answers whether
+a leaf you already hold is in the tree.
+
+```
+stellar contract invoke \
+  --id <statement_registry> \
+  --network testnet \
+  --source <any-identity> \
+  -- verify_charge \
+  --operator GDOLCHAOYP63BEHGAUJJS5IVQNUXLPBWCHO2HZRBTZRU52XBMW2TRJLM \
+  --seq 1 \
+  --record '{"amount":"100000","consumer":"GAJ46LDZSSYAB4YY6VMPM763P652ZROT7TBG3YYE3BZBAUZDXYDDK6OY","endpoint":"ec71df17a899f521f884c5d16596fbb637ce8c83a267889cdfe5f581a1d8172d","ledger":4591000,"price_v":1,"reqid":"abababababababababababababababababababababababababababababababab","units":1}' \
+  --proof '[]'
+```
+
+`--record` is the usage record itself, not a hash of it: the contract derives the
+leaf from these fields and then checks them against the statement before folding the
+proof. `amount` is a string because it is an `i128`. See
+[Verifying a charge](../guides/verifying-a-charge.md) for what each failure means.
 
 ### `open_dispute`
 

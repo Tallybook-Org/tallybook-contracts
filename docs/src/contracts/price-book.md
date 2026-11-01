@@ -68,12 +68,33 @@ buyer calls directly to check which price applied when they were billed. Errors:
 `NotFound` if the timeline is empty, or every entry's `effective_ledger` is after
 `ledger`.
 
+### `extend_version_ttl(env: Env, operator: Address, version: u32, ledgers: u32) -> Result<(), Error>`
+
+**No auth, intentionally.** Anyone may pay rent to keep a published version readable,
+for the same reason `statement_registry.extend_statement_ttl` takes no auth — except
+that here the reason is load bearing rather than merely convenient.
+
+A statement is only falsifiable while the price evidence it names is still readable.
+`Version(operator, v)` holds the schedule hash and URI the amounts were priced
+against; `Timeline(operator)` is what `version_at()` searches to confirm which
+version was in force. Every other writer touching either key is `publish()`, which
+requires the operator's auth — and an operator who has stopped publishing never calls
+it again. Without this function a third party could keep a statement alive
+indefinitely in `statement_registry` while the prices it depends on archived out from
+under it, leaving a record that proves a buyer was billed but no longer proves the
+rate was the one in force.
+
+Extends the version and the timeline together; extending one without the other leaves
+an audit record half readable. `ledgers` is clamped to a sane maximum (`BUMP_AMOUNT`,
+365 days of ledgers), and the extension never shortens an existing TTL. Errors:
+`NotFound` if `operator` has no such published version.
+
 ## Errors
 
 | Discriminant | Variant | Raised by | Meaning |
 |---|---|---|---|
 | 1 | *(unused)* | — | Was `AlreadyInitialized`. Per [CAP-0058](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0058.md), a constructor runs exactly once at creation and is never callable again, so this guard was unreachable on-chain. Left unused rather than renumbered — see [Errors](errors.md). |
-| 2 | `NotFound` | `get_version`, `latest`, `version_at` | No such version, or the operator has never published. |
+| 2 | `NotFound` | `get_version`, `latest`, `version_at`, `extend_version_ttl` | No such version, or the operator has never published. |
 | 3 | `EffectiveInPast` | `publish` | `effective_ledger` is before the current ledger. |
 | 4 | `EffectiveNotAfter` | `publish` | `effective_ledger` doesn't strictly exceed the previous version's. |
 | 5 | `TimelineFull` | `publish` | `TIMELINE_CAP` (256 entries) reached. |

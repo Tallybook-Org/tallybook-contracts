@@ -89,8 +89,29 @@ jobs:
       - name: stellar contract build
         run: make build
 
+      # Runs between build and clippy because it needs the compiled wasm and
+      # nothing else: `stellar contract info interface` reads the exported
+      # functions, the error enum with its discriminants, and every event's
+      # topics back out of the built artifact, and compares all three against
+      # what README.md documents. The README is the interface for everyone not
+      # reading the Rust -- an indexer matching on discriminants, a collector
+      # building calls -- so drift there is a broken contract, not a typo. The
+      # selftest runs first so a check that has stopped firing fails loudly
+      # instead of passing silently.
+      - name: check readme matches the compiled interface
+        run: |
+          python3 scripts/check-interface-docs.py --selftest
+          python3 scripts/check-interface-docs.py
+
       - name: cargo clippy
         run: make clippy
 
       - name: cargo test
         run: make test
+
+      # The deploy scripts are not exercised by cargo test: they shell out to
+      # stellar-cli against a live network. This drives them against a stub
+      # stellar binary instead, which is enough to catch a regression in the
+      # fee parsing and summary output that step 49's scripts print.
+      - name: deploy fee summary
+        run: tests/test_deploy_fee_summary.sh
