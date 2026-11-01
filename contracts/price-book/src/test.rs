@@ -316,3 +316,91 @@ mod version_at {
         assert_eq!(client.version_at(&operator, &(current_ledger + 1_000)), v2);
     }
 }
+
+mod extend_version_ttl {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::String;
+
+    use crate::storage::DataKey;
+    use crate::PriceBookClient;
+
+    use super::*;
+
+    /// Publishes one version for a generated operator and returns
+    /// (env, contract_id, operator, version).
+    fn published() -> (Env, Address, Address, u32) {
+        let (env, contract_id, _admin) = setup();
+        env.mock_all_auths();
+        let client = PriceBookClient::new(&env, &contract_id);
+        let operator = Address::generate(&env);
+        let uri = String::from_str(&env, "https://example.com/schedule.json");
+        let effective = env.ledger().sequence();
+        let version = client.publish(&operator, &schedule_hash(&env, 1), &uri, &effective);
+        (env, contract_id, operator, version)
+    }
+
+    // DataKey is not Clone, so each reading builds its own key rather
+    // than holding one across calls.
+    fn version_ttl(env: &Env, contract_id: &Address, operator: &Address, version: u32) -> u32 {
+        let key = DataKey::Version(operator.clone(), version);
+        env.as_contract(contract_id, || env.storage().persistent().get_ttl(&key))
+    }
+
+    fn timeline_ttl(env: &Env, contract_id: &Address, operator: &Address) -> u32 {
+        let key = DataKey::Timeline(operator.clone());
+        env.as_contract(contract_id, || env.storage().persistent().get_ttl(&key))
+    }
+
+    #[test]
+    fn no_auth_required_and_extends_version_and_timeline() {
+        let (env, contract_id, operator, version) = published();
+        let client = PriceBookClient::new(&env, &contract_id);
+
+        // publish() already extended both keys out to the BUMP_AMOUNT
+        // ceiling, so without advancing the ledger first any extension
+        // would be a correct no-op rather than a real test of growth.
+        env.ledger().set_sequence_number(env.ledger().sequence() + 1_000);
+        let version_before = version_ttl(&env, &contract_id, &operator, version);
+        let timeline_before = timeline_ttl(&env, &contract_id, &operator);
+
+        // Strict enforcement with zero valid auth entries — the strongest
+        // proof that no auth is required, stronger than simply never
+        // having called mock_all_auths (which published() left active).
+        env.mock_auths(&[]);
+        client.extend_version_ttl(&operator, &version, &crate::storage::BUMP_AMOUNT);
+
+        assert!(version_ttl(&env, &contract_id, &operator, version) > version_before);
+        assert!(timeline_ttl(&env, &contract_id, &operator) > timeline_before);
+    }
+
+    #[test]
+    fn clamped_to_a_sane_maximum() {
+        let (env, contract_id, operator, version) = published();
+        let client = PriceBookClient::new(&env, &contract_id);
+        env.ledger().set_sequence_number(env.ledger().sequence() + 1_000);
+
+        client.extend_version_ttl(&operator, &version, &u32::MAX);
+
+        let ttl = version_ttl(&env, &contract_id, &operator, version);
+        assert!(ttl <= crate::storage::BUMP_AMOUNT);
+    }
+
+    #[test]
+    fn not_found_for_unpublished_version() {
+        let (env, contract_id, operator, version) = published();
+        let client = PriceBookClient::new(&env, &contract_id);
+        assert_eq!(
+            client.try_extend_version_ttl(&operator, &(version + 1), &1_000),
+            Err(Ok(Error::NotFound))
+        );
+    }
+
+    #[test]
+    fn not_found_for_an_operator_that_never_published() {
+        let (env, contract_id, _operator, _version) = published();
+        let client = PriceBookClient::new(&env, &contract_id);
+        let stranger = Address::generate(&env);
+        assert_eq!(client.try_extend_version_ttl(&stranger, &1, &1_000), Err(Ok(Error::NotFound)));
+    }
+}
