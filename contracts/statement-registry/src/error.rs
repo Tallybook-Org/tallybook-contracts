@@ -21,7 +21,8 @@ pub enum Error {
     EmptyStatement = 5,
     /// `price_book` has no such version for this operator.
     PriceVersionUnknown = 6,
-    /// That version was not in force at `period_end`.
+    /// The period sits inside one version's window, but that version is
+    /// not the `price_book_version` the caller claimed.
     PriceVersionStale = 7,
     /// `channel` set without `MppSession`, or absent with it.
     ChannelMismatch = 8,
@@ -31,7 +32,7 @@ pub enum Error {
     NotAnchored = 10,
     /// `resolve_dispute` called on a statement that is not `Disputed`.
     NotDisputed = 11,
-    /// `amount_credited > amount_billed`.
+    /// `amount_credited` is negative, or exceeds `amount_billed`.
     CreditTooLarge = 12,
     /// A merkle proof longer than `MAX_PROOF_NODES`.
     ProofTooLong = 13,
