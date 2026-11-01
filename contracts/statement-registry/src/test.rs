@@ -18,6 +18,15 @@ fn hash_pair(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
     env.crypto().sha256(&concatenated).to_bytes()
 }
 
+/// Parses a 64-character hex string from a fixture into a BytesN<32>.
+fn hex_to_bytesn(env: &Env, hex: &str) -> BytesN<32> {
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    BytesN::from_array(env, &bytes)
+}
+
 /// Registers a fresh, real price_book contract (never mocked — the whole
 /// point of §6's PriceVersionStale check is to test against real
 /// on-chain price-book behaviour) and a fresh StatementRegistry pointed at
@@ -707,14 +716,6 @@ mod verify_usage {
     use crate::StatementRegistryClient;
 
     use super::*;
-
-    fn hex_to_bytesn(env: &Env, hex: &str) -> BytesN<32> {
-        let mut bytes = [0u8; 32];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
-        }
-        BytesN::from_array(env, &bytes)
-    }
 
     /// Anchors a minimal, otherwise-valid statement with `usage_root` and
     /// returns (Env, contract_id, operator, seq) for verify_usage calls
@@ -2089,5 +2090,196 @@ mod verify_charge {
             client.try_verify_charge(&a.operator, &(a.seq + 1), &a.records[0], &a.proofs[0]),
             Err(Ok(Error::NotFound))
         );
+    }
+}
+
+/// Properties of `merkle::fold` that a fixed fixture cannot express: that it
+/// agrees with an independently built tree, and that the root it reaches
+/// does not depend on which leaf the proof started from.
+///
+/// Randomised with a fixed-seed LCG rather than a property-testing crate.
+/// The generator is eight lines and runs the same sequence on every machine
+/// and in CI; a dependency would buy shrinking and cost this workspace a new
+/// crate in a repo that pins `soroban-sdk` to an exact patch version on
+/// purpose. A failure here reproduces from the seed printed in the
+/// assertion message.
+mod merkle_properties {
+    use std::vec::Vec as StdVec;
+
+    use soroban_sdk::vec;
+
+    use super::*;
+
+    /// Numerical Recipes' LCG constants. Deterministic, seeded per case, and
+    /// only ever used to pick tree shapes and leaf bytes.
+    struct Lcg(u32);
+
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            self.0
+        }
+
+        fn below(&mut self, bound: u32) -> u32 {
+            self.next_u32() % bound
+        }
+
+        fn leaf(&mut self, env: &Env) -> BytesN<32> {
+            let mut bytes = [0u8; 32];
+            for chunk in bytes.chunks_mut(4) {
+                chunk.copy_from_slice(&self.next_u32().to_be_bytes());
+            }
+            BytesN::from_array(env, &bytes)
+        }
+    }
+
+    /// Builds the tree the collector builds, independently of `merkle::fold`:
+    /// pair each level up with `hash_pair`, promoting a lone trailing node
+    /// unchanged to the next level. Returns the root and one proof per leaf,
+    /// in leaf order.
+    fn reference_tree(
+        env: &Env,
+        leaves: &[BytesN<32>],
+    ) -> (BytesN<32>, StdVec<soroban_sdk::Vec<BytesN<32>>>) {
+        assert!(!leaves.is_empty(), "a tree needs at least one leaf");
+
+        let mut proofs: StdVec<soroban_sdk::Vec<BytesN<32>>> =
+            leaves.iter().map(|_| vec![env]).collect();
+        // Which level-node each leaf currently sits under, so a sibling can
+        // be appended to the right proofs as the levels collapse.
+        let mut owners: StdVec<StdVec<usize>> = (0..leaves.len()).map(|i| std::vec![i]).collect();
+        let mut level: StdVec<BytesN<32>> = leaves.to_vec();
+
+        while level.len() > 1 {
+            let mut next_level = StdVec::new();
+            let mut next_owners: StdVec<StdVec<usize>> = StdVec::new();
+
+            let mut i = 0;
+            while i < level.len() {
+                if i + 1 == level.len() {
+                    // Lone trailing node: promoted unchanged, no proof entry.
+                    next_level.push(level[i].clone());
+                    next_owners.push(owners[i].clone());
+                    break;
+                }
+
+                for leaf_idx in &owners[i] {
+                    proofs[*leaf_idx].push_back(level[i + 1].clone());
+                }
+                for leaf_idx in &owners[i + 1] {
+                    proofs[*leaf_idx].push_back(level[i].clone());
+                }
+
+                next_level.push(hash_pair(env, &level[i], &level[i + 1]));
+                let mut merged = owners[i].clone();
+                merged.extend_from_slice(&owners[i + 1]);
+                next_owners.push(merged);
+                i += 2;
+            }
+
+            level = next_level;
+            owners = next_owners;
+        }
+
+        (level[0].clone(), proofs)
+    }
+
+    /// The reference builder is only a useful oracle if it reproduces the
+    /// roots both repos already committed to, so it is pinned against all
+    /// three tree fixtures before being trusted for random shapes.
+    #[test]
+    fn reference_builder_reproduces_the_committed_fixtures() {
+        let env = Env::default();
+        for json in [
+            include_str!("../../../fixtures/merkle/single-leaf.json"),
+            include_str!("../../../fixtures/merkle/four-leaves.json"),
+            include_str!("../../../fixtures/merkle/seven-leaves.json"),
+        ] {
+            let fixture: serde_json::Value = serde_json::from_str(json).unwrap();
+            let leaves: StdVec<BytesN<32>> = fixture["leaves"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|leaf| hex_to_bytesn(&env, leaf.as_str().unwrap()))
+                .collect();
+            let expected_root = hex_to_bytesn(&env, fixture["root"].as_str().unwrap());
+
+            let (root, proofs) = reference_tree(&env, &leaves);
+            assert_eq!(root, expected_root, "reference tree root differs from the fixture");
+
+            // And the proofs it derives must match the committed ones, not
+            // merely fold to the same root.
+            for entry in fixture["proofs"].as_array().unwrap() {
+                let leaf = hex_to_bytesn(&env, entry["leaf"].as_str().unwrap());
+                let position = leaves.iter().position(|l| *l == leaf).unwrap();
+                let committed: StdVec<BytesN<32>> = entry["proof"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|node| hex_to_bytesn(&env, node.as_str().unwrap()))
+                    .collect();
+                let derived: StdVec<BytesN<32>> = proofs[position].iter().collect();
+                assert_eq!(
+                    derived, committed,
+                    "proof for leaf {position} differs from the fixture"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_reaches_the_reference_root_from_every_leaf() {
+        let env = Env::default();
+
+        for seed in 0..64u32 {
+            let mut rng = Lcg(seed.wrapping_mul(2_654_435_761).wrapping_add(1));
+            // 1..=24 leaves, which covers both parities at every level and
+            // the lone-trailing-node case at several depths.
+            let leaf_count = rng.below(24) + 1;
+            let leaves: StdVec<BytesN<32>> = (0..leaf_count).map(|_| rng.leaf(&env)).collect();
+
+            let (root, proofs) = reference_tree(&env, &leaves);
+
+            for (i, leaf) in leaves.iter().enumerate() {
+                assert_eq!(
+                    crate::merkle::fold(&env, leaf.clone(), &proofs[i]),
+                    root,
+                    "seed {seed}: leaf {i} of {leaf_count} folded to a different root"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_rejects_a_corrupted_proof_node() {
+        let env = Env::default();
+
+        for seed in 0..64u32 {
+            let mut rng = Lcg(seed.wrapping_mul(40_503).wrapping_add(7));
+            // At least two leaves, so every leaf has a non-empty proof to
+            // corrupt.
+            let leaf_count = rng.below(23) + 2;
+            let leaves: StdVec<BytesN<32>> = (0..leaf_count).map(|_| rng.leaf(&env)).collect();
+            let (root, proofs) = reference_tree(&env, &leaves);
+
+            let target = rng.below(leaf_count) as usize;
+            let proof = &proofs[target];
+            let corrupt_at = rng.below(proof.len()) as usize;
+
+            let mut corrupted = vec![&env];
+            for (i, node) in proof.iter().enumerate() {
+                if i == corrupt_at {
+                    corrupted.push_back(rng.leaf(&env));
+                } else {
+                    corrupted.push_back(node);
+                }
+            }
+
+            assert_ne!(
+                crate::merkle::fold(&env, leaves[target].clone(), &corrupted),
+                root,
+                "seed {seed}: corrupting node {corrupt_at} of leaf {target}'s proof still reached the root"
+            );
+        }
     }
 }
