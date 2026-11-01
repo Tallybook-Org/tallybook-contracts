@@ -16,17 +16,17 @@ essentials; the docs site covers everything.
 
 | Contract | Address | Wasm hash | Explorer |
 |---|---|---|---|
-| `price_book` | `CB2IEP4SQ2GC5747HFHNMXEYWEULC5Z5TTTLET2QA4CAA5SYCWAXFKAW` | `b5114557a95572057ad63e5131ea0e3618ad1f983caed42a1724da7c78eda94a` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CB2IEP4SQ2GC5747HFHNMXEYWEULC5Z5TTTLET2QA4CAA5SYCWAXFKAW) |
-| `statement_registry` | `CB75TTWGP3TLKEDGA2WOLEVCNKLUX6X5KS47GMWGBHUAVES7J55LY25M` | `cf10992a1eb272f9fb440ae74bce54b97136e0ae777afaaf82266dc37bed4d5a` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CB75TTWGP3TLKEDGA2WOLEVCNKLUX6X5KS47GMWGBHUAVES7J55LY25M) |
+| `price_book` | `CC6VXCEIXGGFIZXH2DGPVPUXYVVI3YVEQQ5M7XAWNEN7SADIYACTRFZ6` | `d03c8c9b193810b7bc0755d8dc8e517d4b1279cac29f4e1ce0e43d786ec08188` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CC6VXCEIXGGFIZXH2DGPVPUXYVVI3YVEQQ5M7XAWNEN7SADIYACTRFZ6) |
+| `statement_registry` | `CCT5AAVONSVWQGMINQN7TOJGSUZE6KUIFSSMEN2USNNEZFWR5ZX6UKU3` | `c309069607e59b48c7cf65ee4f353a8cefcfe361b73a6c3ae74eb984733defd9` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CCT5AAVONSVWQGMINQN7TOJGSUZE6KUIFSSMEN2USNNEZFWR5ZX6UKU3) |
 
 **Neither contract has been audited, and both are deployed to testnet only. Do not use
 them with real funds — see [SECURITY.md](SECURITY.md).**
 
-The addresses above are the `v0.1.0` build. `price_book::extend_version_ttl` and
-`statement_registry::verify_charge` were added after it and are not live at those
-addresses yet; `make build` reports the current wasm hashes, and the next testnet deploy
-will update this table. Everything else in this README describes the code in this
-repository, which is what `make test` runs against.
+Every function documented below is live at those addresses, including
+`price_book::extend_version_ttl` and `statement_registry::verify_charge`. These
+contracts have no upgrade path by design, so a new build means a new address — the
+`v0.1.0` deployment is still on chain at its own addresses and is simply no longer
+current.
 
 ## The problem
 

@@ -3,9 +3,7 @@
 ## What exists
 
 Both contracts — `price_book` and `statement_registry` — are complete, tested, and
-deployed to testnet. `price_book.extend_version_ttl` and
-`statement_registry.verify_charge` were added after the `v0.1.0` deploy and are not
-live at the published addresses yet. See [Contracts](contracts/overview.md) for the
+deployed to testnet. See [Contracts](contracts/overview.md) for the
 addresses, and [How it works](how-it-works.md) for which of the five settlement steps
 these two contracts cover (anchoring and verification) and where the other three run.
 
