@@ -1828,3 +1828,266 @@ mod leaf {
         assert_ne!(leaf_hash(&env, &record), single);
     }
 }
+
+mod verify_charge {
+    use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::{vec, Vec as SorobanVec};
+    use std::vec::Vec as StdVec;
+
+    use crate::leaf::{leaf_hash, UsageRecord};
+    use crate::types::Protocol;
+    use crate::{StatementRegistry, StatementRegistryClient};
+
+    use super::*;
+
+    /// A statement anchored over a real four-leaf tree of derived records,
+    /// with everything a verify_charge call needs to be checked against it.
+    struct Anchored {
+        env: Env,
+        contract_id: Address,
+        operator: Address,
+        seq: u64,
+        version: u32,
+        period_start: u32,
+        period_end: u32,
+        records: StdVec<UsageRecord>,
+        proofs: StdVec<SorobanVec<BytesN<32>>>,
+    }
+
+    /// Folds four leaves into a balanced tree and returns its root plus one
+    /// proof per leaf. Built with `hash_pair`, the reference pair hash, so
+    /// the tree under test never shares logic with `merkle::fold`.
+    fn four_leaf_tree(
+        env: &Env,
+        leaves: &[BytesN<32>; 4],
+    ) -> (BytesN<32>, StdVec<SorobanVec<BytesN<32>>>) {
+        let left = hash_pair(env, &leaves[0], &leaves[1]);
+        let right = hash_pair(env, &leaves[2], &leaves[3]);
+        let root = hash_pair(env, &left, &right);
+        let proofs = std::vec![
+            vec![env, leaves[1].clone(), right.clone()],
+            vec![env, leaves[0].clone(), right],
+            vec![env, leaves[3].clone(), left.clone()],
+            vec![env, leaves[2].clone(), left],
+        ];
+        (root, proofs)
+    }
+
+    /// Anchors a statement over four records billed to one consumer inside
+    /// one price version's window — the shape an honest period has.
+    fn anchored() -> Anchored {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let price_book_admin = Address::generate(&env);
+        let price_book_id = env.register(crate::price_book::WASM, (price_book_admin,));
+        let contract_id = env.register(StatementRegistry, (admin, price_book_id.clone()));
+        env.mock_all_auths();
+
+        let operator = Address::generate(&env);
+        let consumer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Start the period off ledger 0 so a test can name a ledger
+        // before period_start without underflowing.
+        env.ledger().set_sequence_number(1_000);
+        let period_start = env.ledger().sequence();
+        let version = publish_schedule(&env, &price_book_id, &operator, period_start);
+        let period_end = period_start + 50;
+        env.ledger().set_sequence_number(period_end + 10);
+
+        let mut records = StdVec::new();
+        for i in 0u8..4 {
+            records.push(UsageRecord {
+                amount: 100_000 + i128::from(i),
+                consumer: consumer.clone(),
+                endpoint: BytesN::from_array(&env, &[0x10 + i; 32]),
+                ledger: period_start + 1 + u32::from(i),
+                price_v: version,
+                reqid: BytesN::from_array(&env, &[0x20 + i; 32]),
+                units: 1,
+            });
+        }
+        let leaves = [
+            leaf_hash(&env, &records[0]),
+            leaf_hash(&env, &records[1]),
+            leaf_hash(&env, &records[2]),
+            leaf_hash(&env, &records[3]),
+        ];
+        let (root, proofs) = four_leaf_tree(&env, &leaves);
+
+        let client = StatementRegistryClient::new(&env, &contract_id);
+        let seq = client.anchor(
+            &operator,
+            &consumer,
+            &period_start,
+            &period_end,
+            &root,
+            &4,
+            &token,
+            &400_006i128,
+            &400_006i128,
+            &version,
+            &Protocol::X402,
+            &None,
+        );
+
+        Anchored {
+            env,
+            contract_id,
+            operator,
+            seq,
+            version,
+            period_start,
+            period_end,
+            records,
+            proofs,
+        }
+    }
+
+    #[test]
+    fn happy_path_verifies_every_record_in_the_tree() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        for (i, record) in a.records.iter().enumerate() {
+            assert!(
+                client.verify_charge(&a.operator, &a.seq, record, &a.proofs[i]),
+                "record {i} should verify against the anchored root"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_no_auth() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        // Strict enforcement with zero valid auth entries: a buyer
+        // checking a charge is not a party to anything and must not need
+        // to be.
+        a.env.mock_auths(&[]);
+        assert!(client.verify_charge(&a.operator, &a.seq, &a.records[0], &a.proofs[0]));
+    }
+
+    #[test]
+    fn a_record_the_contract_derives_differently_returns_false() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        // Consistent with the statement on every bound field — same
+        // consumer, same price version, a ledger inside the period — but
+        // the amount was altered, so the leaf the contract derives is not
+        // the leaf that went into the tree. This is the case the old
+        // verify_usage could not catch: handed a leaf computed from the
+        // altered amount it would have folded it happily, and handed the
+        // honest leaf it would have returned true while the caller read
+        // the altered amount off the invoice.
+        let mut tampered = a.records[0].clone();
+        tampered.amount += 1;
+        assert!(!client.verify_charge(&a.operator, &a.seq, &tampered, &a.proofs[0]));
+    }
+
+    #[test]
+    fn a_record_from_another_leaf_position_returns_false() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+        assert!(!client.verify_charge(&a.operator, &a.seq, &a.records[0], &a.proofs[1]));
+    }
+
+    #[test]
+    fn record_consumer_mismatch_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut other = a.records[0].clone();
+        other.consumer = Address::generate(&a.env);
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &other, &a.proofs[0]),
+            Err(Ok(Error::RecordConsumerMismatch))
+        );
+    }
+
+    #[test]
+    fn record_price_mismatch_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut other = a.records[0].clone();
+        other.price_v = a.version + 1;
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &other, &a.proofs[0]),
+            Err(Ok(Error::RecordPriceMismatch))
+        );
+    }
+
+    #[test]
+    fn record_before_period_start_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut other = a.records[0].clone();
+        other.ledger = a.period_start - 1;
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &other, &a.proofs[0]),
+            Err(Ok(Error::RecordOutsidePeriod))
+        );
+    }
+
+    #[test]
+    fn record_after_period_end_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut other = a.records[0].clone();
+        other.ledger = a.period_end + 1;
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &other, &a.proofs[0]),
+            Err(Ok(Error::RecordOutsidePeriod))
+        );
+    }
+
+    #[test]
+    fn a_record_on_the_period_boundaries_is_accepted() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        // period_start and period_end are both inclusive, so a record on
+        // either boundary is in the period. These two fail the membership
+        // check rather than the bounds check — Ok(false), not an error —
+        // which is exactly how an in-period record that isn't in the tree
+        // should read.
+        for ledger in [a.period_start, a.period_end] {
+            let mut edge = a.records[0].clone();
+            edge.ledger = ledger;
+            assert_eq!(
+                client.try_verify_charge(&a.operator, &a.seq, &edge, &a.proofs[0]),
+                Ok(Ok(false))
+            );
+        }
+    }
+
+    #[test]
+    fn proof_too_long_is_rejected() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+
+        let mut proof = vec![&a.env];
+        for _ in 0..=crate::storage::MAX_PROOF_NODES {
+            proof.push_back(BytesN::from_array(&a.env, &[0u8; 32]));
+        }
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &a.seq, &a.records[0], &proof),
+            Err(Ok(Error::ProofTooLong))
+        );
+    }
+
+    #[test]
+    fn not_found_for_missing_statement() {
+        let a = anchored();
+        let client = StatementRegistryClient::new(&a.env, &a.contract_id);
+        assert_eq!(
+            client.try_verify_charge(&a.operator, &(a.seq + 1), &a.records[0], &a.proofs[0]),
+            Err(Ok(Error::NotFound))
+        );
+    }
+}
